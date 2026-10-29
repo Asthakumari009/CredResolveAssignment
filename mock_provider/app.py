@@ -162,6 +162,16 @@ async def reset():
     return {"ok": True}
 
 
+@app.get("/{p}/stats")
+async def stats(p: str):
+    """The provider's own view: how many distinct calls it placed per phone number."""
+    _prof(p)
+    by_phone: dict[str, int] = {}
+    for c in CALLS[p].values():
+        by_phone[c.phone] = by_phone.get(c.phone, 0) + 1
+    return {"calls": len(CALLS[p]), "by_phone": by_phone}
+
+
 @app.get("/health")
 async def health():
     return {"ok": True}

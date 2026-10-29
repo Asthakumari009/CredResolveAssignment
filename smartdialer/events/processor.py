@@ -9,7 +9,7 @@ in-memory queue to lose.
 
 LOCK ORDER: inbox row -> call -> borrower -> agent.
 """
-from smartdialer.domain.call_sm import EVENT_TARGETS, Verdict
+from smartdialer.domain.call_sm import EVENT_TARGETS, SYNTHETIC_ONLY, Verdict
 from smartdialer.faults import crash_point
 from smartdialer.transitions import advance_call
 
@@ -45,8 +45,8 @@ def process_one(conn, worker_id: str) -> dict | None:
                    WHERE id = %(id)s""", {"f": final, "id": ev["id"]})
             return {**ev, "processing_result": "ORPHAN" if final else None}
 
-        synthetic_only = ev["event_type"] == "NOT_FOUND" and not ev["provider_event_id"].startswith("reconcile:")
-        if ev["event_type"] not in EVENT_TARGETS or synthetic_only:   # a provider cannot send NOT_FOUND
+        forged = ev["event_type"] in SYNTHETIC_ONLY and not ev["provider_event_id"].startswith("reconcile:")
+        if ev["event_type"] not in EVENT_TARGETS or forged:   # a provider cannot send NOT_FOUND / TIMEOUT
             result = "REJECTED"
         else:
             target, reason = EVENT_TARGETS[ev["event_type"]]

@@ -60,12 +60,48 @@ def services():
         _wait_healthy(MOCK_URL, procs[0])
         _wait_healthy(WEBHOOK_URL, procs[1])
         httpx.post(MOCK_URL + "/control/reset")
-        yield
+        from demos.agent_desk import AgentDesk
+        desk = AgentDesk()
+        desk.start()
+        try:
+            yield
+        finally:
+            desk.stop()
     finally:
         for p in procs:
             p.terminate()
         for p in procs:
             p.wait(timeout=10)
+
+
+def start_worker(worker_id: str, crash_at: str | None = None, seconds: float = 120) -> subprocess.Popen:
+    env = {**os.environ, "PROVIDER_URL": MOCK_URL}
+    if crash_at:
+        env["SMARTDIALER_CRASH_AT"] = crash_at
+    say(f"starting worker {worker_id}" + (f" (will SIGKILL itself at '{crash_at}')" if crash_at else ""))
+    return subprocess.Popen([sys.executable, "-m", "smartdialer.worker.main", "--id", worker_id, "--seconds", str(seconds)], env=env)
+
+
+def wait_for(predicate, timeout_s: float, what: str):
+    end = time.monotonic() + timeout_s
+    while time.monotonic() < end:
+        if predicate():
+            return True
+        time.sleep(0.1)
+    say(f"timed out waiting for: {what}")
+    return False
+
+
+def stop(*procs: subprocess.Popen):
+    for p in procs:
+        if p.poll() is None:
+            p.terminate()
+    for p in procs:
+        p.wait(timeout=10)
+
+
+def provider_stats(provider: str) -> dict:
+    return httpx.get(f"{MOCK_URL}/{provider.lower()}/stats").json()
 
 
 def control(provider: str, **changes):

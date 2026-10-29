@@ -77,7 +77,13 @@ def decide(proposal: PacingProposal, snap: Snapshot, cfg: CampaignSettings, memo
                          f" - {snap.unbound_in_flight} in flight = {cap}")
             approved, outcome = cap, "REDUCE"
 
-    # 6. PROVIDER_HEALTH (partial): HALF_OPEN lets only a few probe calls through.
+    # 6. PROVIDER_HEALTH (partial): DEGRADED cuts volume; HALF_OPEN lets only a few probe calls through.
+    if snap.breaker_state == "DEGRADED" and approved > 0:
+        reduced = math.floor(approved * cfg.degraded_factor)
+        reasons.append("PROVIDER_HEALTH")
+        notes.append(f"breaker DEGRADED: {approved} x {cfg.degraded_factor} -> {reduced}")
+        approved = reduced
+        outcome = outcome if outcome == "FALLBACK_TO_PROGRESSIVE" else "REDUCE"
     if snap.breaker_state == "HALF_OPEN" and approved > cfg.half_open_probes:
         reasons.append("PROVIDER_HEALTH")
         notes.append(f"breaker HALF_OPEN: at most {cfg.half_open_probes} probe calls")

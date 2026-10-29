@@ -72,8 +72,11 @@ EVENT_TARGETS: dict[str, tuple[CallState, str | None]] = {
     "NO_ANSWER": (S.FAILED, "NO_ANSWER"),
     "BUSY": (S.FAILED, "BUSY"),
     "FAILED": (S.FAILED, "PROVIDER_ERROR"),
-    "NOT_FOUND": (S.CANCELLED, "NOT_DIALED"),   # synthesized by reconciliation, never by a provider
+    # Synthesized by reconciliation only; an event of these types from a provider is REJECTED.
+    "NOT_FOUND": (S.CANCELLED, "NOT_DIALED"),
+    "TIMEOUT": (S.FAILED, "TIMEOUT"),
 }
+SYNTHETIC_ONLY = frozenset({"NOT_FOUND", "TIMEOUT"})
 
 
 def classify(current: str, target: str) -> Verdict:

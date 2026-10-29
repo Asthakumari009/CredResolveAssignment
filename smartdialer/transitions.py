@@ -193,8 +193,9 @@ def _settle_borrower(conn, call, rng):
         new, outcome, delay, undo_attempt = "DONE", "ABANDONED", 0.0, False
     elif answered:
         new, outcome, delay, undo_attempt = "DONE", "CONNECTED", 0.0, False
-    elif state == S.CANCELLED and reason == "NOT_DIALED":
-        # Never reached the provider: does not count as an attempt, try again now.
+    elif state == S.CANCELLED and call["dialed_at"] is None and call["provider_call_id"] is None:
+        # Never confirmed dialed (provider had no such call, or the agent left before the dial
+        # was recorded): does not count as an attempt, try again now.
         new, outcome, delay, undo_attempt = "PENDING", "NOT_DIALED", 0.0, True
     else:
         b = conn.execute("SELECT attempts FROM borrowers WHERE id = %s", (call["borrower_id"],)).fetchone()
