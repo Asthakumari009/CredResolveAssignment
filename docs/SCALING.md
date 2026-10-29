@@ -1,7 +1,12 @@
 # Scaling
 
-All current numbers here are measured on the current code by `make loadtest ARGS="--workers 8 16 32"`
-(`loadtest/run.py`, raw output in `results/loadtest/results.json`, which is local and not committed).
+Current numbers are measured on the current code by `make loadtest` (8 workers; `loadtest/run.py`, raw
+output in `results/loadtest/results.json`, which is local and not committed).
+
+**Read this first: the mock provider, the webhook receiver, Postgres and the dialer workers all share the
+same 8 CPUs. Runs above 8 workers measure the test harness, not the dialer.** Past 8 workers the mock's
+event delivery is starved of CPU, events arrive seconds late, and what the numbers show is the Safety
+Controller correctly refusing to dial into that. Only the 8-worker run is a measurement of the dialer.
 Each run is a fresh database with **1,000 agents, 50,000 borrowers, one progressive campaign,
 Provider A, 60 s**.
 
@@ -18,32 +23,25 @@ Provider A, 60 s**.
   the worker has no units left, then the pin), borrower lease, agent reservation, call insert, commit.
   Lock waits are sampled from `pg_stat_activity` every 250 ms. "Lock-wait s" is waiting backends x interval,
   an estimate.
-- **The mock provider is part of the measurement.** Its webhook delivery competes for the same 8 CPUs.
-  ANSWERED events reached the inbox a median 1.2 / 1.5 / 3.9 s after the provider sent them at 8 / 16 / 32
-  workers, with bursts much worse (EVENT_LAG saw up to 6.8 s). Processing them once received takes tens of ms.
-  See "Late events: the EVENT_LAG rule" below.
+- With the per-tick cap and the recovery ramp in place, the 8-worker run keeps event delivery healthy:
+  ANSWERED reached the inbox a median 21 ms after the provider sent it (1.2 s before the cap).
 
-## Results (current code)
+## Results (current code, 8 workers)
 
 | Workers | Reservations/s | p50 ms | p95 ms | p99 ms | Backends waiting on a lock (avg / max) | Lock-wait s (est.) | Inbox lag p50 / p99 ms | DB connections (peak) | Invariant violations |
 |---|---|---|---|---|---|---|---|---|---|
-| 8 | **86.3** | 8.1 | 25 | 47 | 0.02 / 2 | 1 | 41 / 722 | 44 | 0 |
-| 16 | **54.2** | 11.5 | 43 | 193 | 0.11 / 7 | 6 | 19 / 1,443 | 55 | 0 |
-| 32 | **32.8** | 24.3 | 114 | 271 | 0.34 / 18 | 21 | 13 / 365 | 69 | 0 |
+| 8 | **102.8** | 6.4 | 19 | 36 | 0.03 / 2 | 2 | 20 / 400 | 45 | 0 |
 
-| Workers | Answered | Abandoned | Abandon rate | Decisions rejected by EVENT_LAG | Worst event lag seen |
-|---|---|---|---|---|---|
-| 8 | 1,562 | 41 | **2.6%** | 36 of 89 | 2,075 ms |
-| 16 | 954 | 367 | **38.5%** | 106 of 135 | 6,195 ms |
-| 32 | 592 | 546 | **92.2%** | 116 of 122 | 6,812 ms |
+| Answered | Abandoned | Abandon rate | Decisions | Capped by MAX_PER_TICK | Ramped (RECOVERY_RAMP) | Rejected by EVENT_LAG | Worst event lag |
+|---|---|---|---|---|---|---|---|
+| 1,876 | 0 | **0.0%** | 127 | 127 | 40 (the first 20 s) | 0 | 481 ms |
 
-Inbox lag is `processed_at - received_at`, so it does not include webhook delivery. Event lag (the
-EVENT_LAG rule) does: it runs from the provider's timestamp. At 16 and 32 workers, throughput is
-low on purpose: EVENT_LAG holds dialing for most of the run.
+Inbox lag is `processed_at - received_at`. Event lag (the EVENT_LAG rule) runs from the provider's timestamp,
+so it includes webhook delivery.
 
-All invariants held in every run: no borrower with overlapping calls, no agent bound to two calls,
-every transition legal and chained, no duplicate transitions, permits never over-claimed, and calls per
-permit never more than claimed units.
+All invariants held: no borrower with overlapping calls, no agent bound to two calls, every transition legal
+and chained, no duplicate transitions, permits never over-claimed, and calls per permit never more than
+claimed units.
 
 ### Historical: the batch-claims fix (commit f550fcc)
 
@@ -100,48 +98,47 @@ Measured at commit f550fcc (historical table above):
 
 ## Now: what limits the current code
 
-| Workers | Pacing tick gap avg (target 250 ms) | Units approved | Units claimed | Calls |
-|---|---|---|---|---|
-| 8 | 641 ms | 12,515 | 5,594 | 5,311 |
-| 16 | 416 ms | 6,506 | 3,489 | 3,299 |
-| 32 | 383 ms | 3,371 | 2,260 | 2,019 |
+At 8 workers: 6,350 units approved, 6,350 claimed, 6,350 calls. Every unit approved was used, and every one
+of the 127 decisions was capped at 50 by MAX_PER_TICK. **The per-tick cap is now the limit, by design:**
+50 calls per tick with ticks every 444 ms on average is at most about 113 calls/s, and the run did 103/s
+against about 150/s of demand.
 
-- **At 8 workers the dialer's own capacity is the limit**: about 86 reservations/s against about 150/s
-  of demand. 55% of approved units are never claimed before the permit is replaced. Each worker is one
-  Python loop that also does provider I/O, and the pacing leader is one of them, so its ticks arrive every
-  640 ms instead of 250 ms. An agent who frees up just after a tick waits for the next one.
-- **At 16 and 32 workers the limit is event delivery, and the Safety Controller enforces it.** The mock's
-  webhook delivery shares the 8 CPUs with 16 to 32 workers and falls behind, so EVENT_LAG rejects most
-  decisions. Ticks are faster here only because the leader has almost nothing to dispatch.
+- That is a deliberate trade: no single decision can release a burst the provider and the inbox cannot
+  absorb. Raising throughput means ticking on time (250 ms gives 200/s at the same cap, fix 2 below) or raising
+  `max_approved_per_tick`, not removing the cap.
+- The pacing leader is still an ordinary worker, so its ticks arrive every 444 ms instead of 250 ms (fix 2).
 
-## Late events: the EVENT_LAG rule
+## Late events: EVENT_LAG, the recovery ramp and the per-tick cap
 
-The previous sweep, before this rule, found a safety gap: at 32 workers ANSWERED reached the inbox a median
-8.3 s late, 1,034 of 1,072 answered calls (96%) were abandoned, and the Safety Controller kept approving.
-ABANDON_BUDGET only forces progressive, and progressive abandons just as surely when nobody sees the
-answer in time.
+**The gap.** At 32 workers (commit b75107d) ANSWERED reached the inbox a median 8.3 s late, 1,034 of 1,072
+answered calls (96%) were abandoned, and the Safety Controller kept approving. ABANDON_BUDGET only forces
+progressive, and progressive abandons just as surely when nobody sees the answer in time.
 
-EVENT_LAG (PLAN D17) takes the lag from the inbox: provider timestamp to applied (or to now, if still
-waiting), p90 over the last 10 s, or the age of the oldest unprocessed event, whichever is worse. Above
-`max_answer_hold_ms` (2 s) it REJECTS every dial, progressive included. What the rerun shows:
+**EVENT_LAG (PLAN D17).** Event lag from the inbox: provider timestamp to applied (or to now, if still waiting),
+p90 over the last 10 s, or the age of the oldest unprocessed event, whichever is worse. Above
+`max_answer_hold_ms` (2 s) it REJECTS every dial, progressive included. Rerun at commit 1b35c59, before the
+ramp and cap (16 and 32 workers measure the harness, see the top of this page, but they show the rule's behaviour):
 
-- **8 workers:** it fired on 36 of 89 decisions, briefly, each time lag crossed 2 s. Abandon rate 2.6%,
-  under the 3% budget.
-- **32 workers:** it fired 7.5 s into the run and rejected 116 of 122 decisions. The abandon rate is still
-  92%, for two reasons visible in the decision log:
-  1. **The opening burst is invisible to it.** In the first 5 s the controller approved 1,000 + 651 + 145
-     calls while the inbox was still on time (lag 0, 420, 941 ms). Their answers then arrived late. 249 of
-     the 546 abandons are from calls dialed before the rule could see anything.
-  2. **It releases into a full burst.** When the 10 s window cleared (28 s in), progressive approved all
-     1,000 available agents at once, and the next 360 and 215 on the following ticks. That overloaded
-     delivery again. The other 297 abandons come from that second wave.
+| Workers | Abandon rate | Decisions rejected by EVENT_LAG |
+|---|---|---|
+| 8 | 2.6% | 36 of 89 |
+| 16 | 38.5% | 106 of 135 |
+| 32 | 92.2% | 116 of 122 |
 
-So the rule stops dialing into a backlog it can see, but it is reactive: it needs events to arrive late
-before it knows they are late. Proposed fixes, **NOT BUILT**: ramp approvals back up after EVENT_LAG
-clears, like the breaker's recovery ramp (20% to 100% over 20 s), and cap the size of any single
-approval, including progressive cold start, so 1,000 dials never leave in one tick. In production the
-real fix for the overload itself is event processing apart from provider I/O (fix 2) and webhook capacity
-sized for the peak dial rate.
+It was reactive, and at 32 workers the decision log showed why it still lost most answers: the opening burst
+(1,000 + 651 + 145 approvals in 5 s) went out before any event was late enough to see, and when the lag
+window cleared, progressive released all 1,000 available agents in one tick and overloaded delivery again.
+
+**RECOVERY_RAMP and MAX_PER_TICK (PLAN D18)** close both holes:
+
+- After startup or any pause in dialing (a REJECT for EVENT_LAG, PROVIDER_HEALTH or the calling window,
+  HALF_OPEN probes, an AGENT_DROP cooldown), approvals ramp from 20% to 100% over 20 s.
+- No decision approves more than `max_approved_per_tick` (default 50), in any mode, progressive and
+  COLD_START included.
+
+Effect at 8 workers: abandon rate 2.6% to 0.0%, EVENT_LAG rejects 36 to 0, ANSWERED delivery lag 1.2 s to
+21 ms, throughput 86 to 103 reservations/s. Bounding the burst kept delivery healthy, which kept every answer
+on time.
 
 ## Why "add more servers" makes it worse
 
@@ -150,8 +147,9 @@ It adds waiters:
 
 - Before the fix, every extra worker queued on the permit lock while holding a connection, the lock
   holder ran slower on a busier CPU, and throughput fell from 123/s to 78/s (historical sweep).
-- On the current code, adding workers past 8 lowers throughput from 86/s to 33/s at 32. Most of that drop is
-  deliberate: more processes on the same CPUs slow event delivery, and EVENT_LAG then holds dialing.
+- At commit 1b35c59, adding workers past 8 lowered throughput from 86/s to 33/s at 32. On this machine that
+  measures the harness: more processes on the same 8 CPUs starve the mock's event delivery, and EVENT_LAG
+  then holds dialing.
 - Workers stuck on a lock are not processing events, so event lag rises too (before: 97 ms to 493 ms p50).
 
 The fix is always to remove the shared hot row, or the single serial step, from the path, not to add
@@ -174,20 +172,20 @@ one, which lowers U and therefore the dial rate. For 1,000 agents, with the simu
 
 | Scenario | p | T_talk | dials/s at U = 100% (upper bound) | dials/s at the simulator's measured predictive U |
 |---|---|---|---|---|
-| A | 20% | 120 s | 1000 / (0.20 x 135) = **37.0** | 37.0 x 64.7% = 24.0 |
-| B | 50% | 90 s | 1000 / (0.50 x 105) = **19.0** | 19.0 x 70.4% = 13.4 |
-| C | 70% | 180 s | 1000 / (0.70 x 195) = **7.3** | 7.3 x 88.2% = 6.5 |
+| A | 20% | 120 s | 1000 / (0.20 x 135) = **37.0** | 37.0 x 64.4% = 23.8 |
+| B | 50% | 90 s | 1000 / (0.50 x 105) = **19.0** | 19.0 x 70.3% = 13.4 |
+| C | 70% | 180 s | 1000 / (0.70 x 195) = **7.3** | 7.3 x 87.3% = 6.4 |
 
 So 1,000 agents need **at most about 37 dials/s**, at the lowest answer rate (A), and the rate scales linearly
 with N. Each dial produces 3 to 4 inbox events. Measured per-campaign throughput on the current code, on one 8-CPU
-machine with the mock provider sharing it: about 86 reservations/s at 8 workers. At 16 and 32 workers
-the EVENT_LAG rule holds dialing because the mock's event delivery falls behind.
+machine with the mock provider sharing it: about 103 reservations/s at 8 workers, held there by the per-tick
+cap (50 per tick).
 
 | Agents | Dials/s (C to A, upper bound) | Inbox events/s | What breaks first |
 |---|---|---|---|
 | 100 | 0.7 to 3.7 | up to about 13 | Nothing. One worker is enough; more workers are for crash tolerance |
-| 1,000 | 7 to 37 | up to about 130 | Nothing in one campaign: 37/s is under half of the measured 86/s. The `provider_health` row (C5) and the per-tick snapshot query start to show up if there are many campaigns |
-| 10,000 | 73 to 370 | up to about 1,300 | **Per-campaign permit supply**, if those agents are in one campaign at a low answer rate: A needs 370/s and B 190/s, against about 86/s measured (pacing tick cadence, then the claim row). C (73/s) fits, barely.
+| 1,000 | 7 to 37 | up to about 130 | Nothing in one campaign: 37/s is about a third of the measured 103/s. The `provider_health` row (C5) and the per-tick snapshot query start to show up if there are many campaigns |
+| 10,000 | 73 to 370 | up to about 1,300 | **Per-campaign permit supply**, if those agents are in one campaign at a low answer rate: A needs 370/s and B 190/s, against about 103/s measured (the per-tick cap at the current tick cadence, then the claim row). C (73/s) fits.
 Event delivery must keep up too, or EVENT_LAG holds dialing. Next: inbox write volume and connection count as workers grow |
 | 100,000 | 730 to 3,700 | up to about 13,000 | Single Postgres write throughput for transitions plus inbox, connection count, and the inbox table size |
 
@@ -198,7 +196,8 @@ Event delivery must keep up too, or EVENT_LAG holds dialing. Next: inbox write v
    per 10 calls and keeps the existing lock order.
 2. **A dedicated pacing loop. NOT BUILT.** Run the leader's tick on its own thread or process, so it is never
    behind a 3 s provider call or a batch of events. Ticks then arrive every 250 ms and permits track
-   agents as they free up. This is the measured bottleneck now.
+   agents as they free up. With the per-tick cap of 50, throughput is cap / tick gap, so on-time ticks
+   raise it from about 113/s to 200/s without loosening the cap.
 3. **Permit shards. NOT BUILT.** The Safety Controller splits an approval of N into S rows of N/S each, and
    each worker claims from shard `hash(worker) % S`, falling back to others when its shard is empty.
    The total stays exactly N (the sum of approvals), and claim contention drops by S.

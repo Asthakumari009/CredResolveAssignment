@@ -47,12 +47,15 @@ def test_decision_is_logged_with_inputs_and_permit_issued(conn):
     cid = make_campaign(conn, agents=3)
     token = try_lead(conn, cid, "leader", 3000)
     d = _decide(conn, cid, "leader", token)
-    assert (d.outcome, d.approved_calls) == ("REDUCE", 3)
+    # A new campaign's first decision: 3 agents available, then the startup ramp (20%, never below 1).
+    assert (d.outcome, d.approved_calls) == ("REDUCE", 1)
     row = conn.execute("SELECT * FROM safety_decisions WHERE id = %s", (d.decision_id,)).fetchone()
-    assert row["requested"] == 5 and row["approved_count"] == 3 and row["reason_codes"] == ["PROGRESSIVE_BUDGET"]
-    assert row["snapshot"]["available"] == 3 and "available=3" in row["explanation"]
+    assert row["requested"] == 5 and row["approved_count"] == 1
+    assert row["reason_codes"] == ["PROGRESSIVE_BUDGET", "RECOVERY_RAMP"]
+    assert row["snapshot"]["available"] == 3 and "available=3" in row["explanation"] and "ramping" in row["explanation"]
+    assert conn.execute("SELECT safety_state FROM campaigns").fetchone()["safety_state"]["ramp_from"] is not None
     p = conn.execute("SELECT * FROM dial_permits WHERE id = %s", (d.permit_id,)).fetchone()
-    assert p["approved_count"] == 3 and p["fencing_token"] == token and not p["revoked"]
+    assert p["approved_count"] == 1 and p["fencing_token"] == token and not p["revoked"]
 
 
 def test_non_leader_is_rejected_and_cannot_revoke_the_leaders_permit(conn):

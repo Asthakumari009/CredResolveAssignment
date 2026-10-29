@@ -50,7 +50,12 @@ def main():
         say("warming up until the campaign is dialing predictively ...")
         wait_for(lambda: conn.execute("SELECT count(*) AS n FROM safety_decisions WHERE mode = 'PREDICTIVE' AND approved_count > 0"
                                       ).fetchone()["n"] > 20, 60, "predictive approvals")
-        time.sleep(8)
+        # Steady state first: the startup RECOVERY_RAMP (20 s) must be over, or the drop is measured
+        # against decisions that are already being held back for another reason.
+        wait_for(lambda: (r := conn.execute("SELECT mode, reason_codes FROM safety_decisions ORDER BY id DESC LIMIT 1"
+                                           ).fetchone()) and r["mode"] == "PREDICTIVE" and "RECOVERY_RAMP" not in r["reason_codes"],
+                 60, "startup ramp to finish")
+        time.sleep(3)
 
         drop_start = conn.execute("SELECT clock_timestamp() AS t").fetchone()["t"]
         say("dropping 40 agents over 3 seconds")
@@ -74,7 +79,8 @@ def main():
             """SELECT min(at) AS t FROM safety_decisions WHERE at >= %s AND mode = 'PREDICTIVE'
                AND 'HARD_RATIO_CAP' = ANY(reason_codes)""", (drop_start,)).fetchone()["t"]
         first_protective = conn.execute(
-            """SELECT at, outcome, reason_codes FROM safety_decisions WHERE at >= %s AND outcome <> 'APPROVE'
+            """SELECT at, outcome, reason_codes FROM safety_decisions WHERE at >= %s
+                 AND (outcome IN ('REJECT', 'FALLBACK_TO_PROGRESSIVE') OR reason_codes && '{AGENT_DROP,HARD_RATIO_CAP}')
                ORDER BY at LIMIT 1""", (first_left_at,)).fetchone()
         before = abandons(conn, drop_start - (drop_end - drop_start) * 5, drop_start)
         during = abandons(conn, drop_start, drop_end + (drop_end - drop_start) * 3)

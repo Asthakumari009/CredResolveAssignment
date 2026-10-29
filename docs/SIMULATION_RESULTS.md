@@ -28,25 +28,25 @@ this top section is hand-written.
 These follow directly from the table and charts:
 
 - **The gain is largest when the answer rate is low.** Scenario A (20%): predictive raises
-  utilization from 47% to 65% (+38%) on Provider A with zero abandons. B (50%): +11%. C (70%, long
-  calls): +3%, because progressive already keeps agents at 85%, and a high `p_hi` makes predictive
-  pacing cautious.
-- **Provider A never comes near the 3% budget.** The worst predictive abandon rate is 0.37% (scenario C).
+  utilization from 45% to 64% (+42%) on Provider A, with 2 abandons in 883 answered (0.23%). B (50%): +12%.
+  C (70%, long calls): +2%, because progressive already keeps agents at 86%, and a high `p_hi` makes
+  predictive pacing cautious.
+- **Provider A never comes near the 3% budget.** The worst predictive abandon rate is 0.98% (scenario D).
   Most predictive decisions are trimmed by HARD_RATIO_CAP rather than by the statistical target:
   the hard cap does real work.
-- **Provider B uses up the abandon budget before pacing does.** Even progressive mode abandons 1.9 to
-  3.1% on B, purely from lost ANSWERED events. ABANDON_BUDGET then keeps predictive in progressive
-  fallback for much of the run (predictive only 19 to 71% of ticks), and the gain shrinks to between
-  -2% and +16%. In scenario D on B, predictive finishes at 3.58%: the provider baseline is already
-  at the threshold, and hysteresis cannot pull a rate below what the provider produces by itself.
+- **Provider B uses up the abandon budget before pacing does.** Even progressive mode abandons 1.7 to
+  2.7% on B, purely from lost ANSWERED events. ABANDON_BUDGET then keeps predictive in progressive
+  fallback for much of the run (predictive only 15 to 43% of ticks), and the gain shrinks to between
+  0% and +23%. In scenario A on B, predictive finishes at 3.03%: the provider baseline is already
+  near the threshold, and hysteresis cannot pull a rate below what the provider produces by itself.
   The lesson is about routing: predictive campaigns belong on a provider with reliable events, and
   abandons should be attributed per provider.
-- **Answer-rate shock up (E, 20% to 70%) is contained, not prevented.** HARD_RATIO_CAP starts cutting
-  12 s after the jump. ANSWER_RATE_DRIFT forces progressive at +44 s, because the answer-rate window
-  only uses calls whose outcome is known. The 5 minutes after the shock cost 3 abandons out of 107
-  answered (2.8%). Run `make demo-answer-rate-shock` for the decision-by-decision table.
+- **Answer-rate shock up (E, 20% to 70%) is contained, not prevented.** The first ratio cap or fallback
+  comes 29 s after the jump. ANSWER_RATE_DRIFT forces progressive at +51 s, because the answer-rate window
+  only uses calls whose outcome is known. The 5 minutes after the shock cost 3 abandons out of 99
+  answered (3.0%, at the budget). Run `make demo-answer-rate-shock` for the decision-by-decision table.
 - **Answer-rate shock down (F, 70% to 10%) carries no compliance risk.** Agents go idle, drift
-  falls back briefly at +51 s, the window relearns, and predictive resumes at a much higher dial ratio.
+  falls back briefly at +65 s, the window relearns, and predictive resumes at a much higher dial ratio.
 - **The outage on B is visible at minute 30:** zero dials while the breaker is OPEN, then HALF_OPEN
   probe calls and recovery.
 
@@ -56,7 +56,7 @@ These follow directly from the table and charts:
   captures almost all of the benefit with none of the risk.
 - The binding constraints in practice were the hard rules (ratio cap, abandon budget), not the
   statistical target. That is the intended design: the statistics propose, the rules decide.
-- Drift detection lag (~45 s) is the weakest point in the dangerous direction. Next step: an early
+- Drift detection lag (~50 s) is the weakest point in the dangerous direction. Next step: an early
   signal from answers alone, which resolve in seconds, before the no-answers come in.
 - Provider quality matters more than the pacing algorithm once event loss approaches the abandon
   budget.
@@ -67,26 +67,26 @@ These follow directly from the table and charts:
 
 | Scenario | Provider | Mode | Utilization | Connects / agent-hour | Abandon rate | Abandoned / answered | Ticks in predictive mode |
 |---|---|---|---|---|---|---|---|
-| A | A | progressive | 47.0% | 13.0 | 0.00% | 0 / 609 | 0% |
-| A | A | predictive | 64.7% | 18.4 | 0.00% | 0 / 860 | 100% |
-| A | B | progressive | 41.8% | 11.9 | 1.94% | 11 / 567 | 0% |
-| A | B | predictive | 53.2% | 14.8 | 2.54% | 18 / 708 | 51% |
-| B | A | progressive | 63.2% | 25.0 | 0.00% | 0 / 1166 | 0% |
-| B | A | predictive | 70.4% | 26.8 | 0.00% | 0 / 1252 | 100% |
-| B | B | progressive | 59.2% | 23.6 | 2.22% | 25 / 1127 | 0% |
-| B | B | predictive | 62.0% | 24.7 | 2.53% | 30 / 1184 | 44% |
-| C | A | progressive | 85.3% | 16.7 | 0.00% | 0 / 779 | 0% |
-| C | A | predictive | 88.2% | 17.3 | 0.37% | 3 / 812 | 100% |
-| C | B | progressive | 83.4% | 16.2 | 1.94% | 15 / 773 | 0% |
-| C | B | predictive | 84.0% | 16.5 | 2.90% | 23 / 794 | 35% |
-| D | A | progressive | 55.6% | 18.2 | 0.00% | 0 / 851 | 0% |
-| D | A | predictive | 65.4% | 21.1 | 0.30% | 3 / 989 | 98% |
-| D | B | progressive | 54.7% | 16.9 | 1.98% | 16 / 807 | 0% |
-| D | B | predictive | 58.0% | 19.3 | 2.17% | 20 / 921 | 38% |
-| E | A | progressive | 65.8% | 19.3 | 0.00% | 0 / 580 | 0% |
-| E | A | predictive | 74.6% | 20.6 | 0.48% | 3 / 622 | 76% |
-| F | A | progressive | 50.3% | 15.0 | 0.00% | 0 / 449 | 0% |
-| F | A | predictive | 64.2% | 18.6 | 0.18% | 1 / 559 | 95% |
+| A | A | progressive | 45.3% | 13.6 | 0.00% | 0 / 633 | 0% |
+| A | A | predictive | 64.4% | 18.9 | 0.23% | 2 / 883 | 100% |
+| A | B | progressive | 42.0% | 13.0 | 1.94% | 12 / 619 | 0% |
+| A | B | predictive | 51.6% | 15.1 | 3.03% | 22 / 727 | 43% |
+| B | A | progressive | 62.8% | 25.4 | 0.00% | 0 / 1186 | 0% |
+| B | A | predictive | 70.3% | 26.8 | 0.00% | 0 / 1249 | 100% |
+| B | B | progressive | 61.7% | 23.5 | 1.70% | 19 / 1115 | 0% |
+| B | B | predictive | 63.1% | 23.4 | 2.67% | 30 / 1124 | 29% |
+| C | A | progressive | 85.8% | 16.0 | 0.00% | 0 / 746 | 0% |
+| C | A | predictive | 87.3% | 16.7 | 0.51% | 4 / 783 | 99% |
+| C | B | progressive | 84.5% | 15.6 | 2.68% | 20 / 745 | 0% |
+| C | B | predictive | 84.3% | 16.1 | 2.97% | 23 / 775 | 15% |
+| D | A | progressive | 55.8% | 17.9 | 0.00% | 0 / 835 | 0% |
+| D | A | predictive | 64.3% | 21.6 | 0.98% | 10 / 1016 | 85% |
+| D | B | progressive | 54.6% | 17.1 | 1.97% | 16 / 813 | 0% |
+| D | B | predictive | 57.9% | 19.6 | 2.25% | 21 / 935 | 38% |
+| E | A | progressive | 65.0% | 19.9 | 0.00% | 0 / 597 | 0% |
+| E | A | predictive | 73.9% | 21.3 | 0.47% | 3 / 643 | 74% |
+| F | A | progressive | 49.7% | 14.4 | 0.00% | 0 / 433 | 0% |
+| F | A | predictive | 63.7% | 16.3 | 0.00% | 0 / 490 | 93% |
 
 ### Charts
 

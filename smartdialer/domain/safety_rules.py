@@ -17,6 +17,9 @@ from smartdialer.domain.calling_window import is_open
 from smartdialer.domain.types import PacingProposal, SafetyDecision, Snapshot
 
 PROGRESSIVE, PREDICTIVE = "PROGRESSIVE", "PREDICTIVE"
+# Rejects that say nothing about whether dialing is safe, only that this particular decision is
+# void (a deposed leader, an old snapshot). They do not restart the recovery ramp.
+RAMP_EXEMPT = ("NOT_PACING_LEADER", "STALE_SNAPSHOT")
 
 
 def progressive_budget(snap: Snapshot) -> int:
@@ -31,6 +34,8 @@ def decide(proposal: PacingProposal, snap: Snapshot, cfg: CampaignSettings, memo
     notes: list[str] = []
 
     def reject(code: str, note: str):
+        if code not in RAMP_EXEMPT:
+            mem["ramp_from"] = None   # dialing is paused: the next unrestricted decision starts a ramp
         return SafetyDecision(0, proposal.mode, "REJECT", (code,), notes=(note,)), mem
 
     # 8. NOT_PACING_LEADER: a deposed leader's opinion is worthless.
@@ -96,18 +101,34 @@ def decide(proposal: PacingProposal, snap: Snapshot, cfg: CampaignSettings, memo
         notes.append(f"breaker HALF_OPEN: at most {cfg.half_open_probes} probe calls")
         approved = cfg.half_open_probes
         outcome = outcome if outcome == "FALLBACK_TO_PROGRESSIVE" else "REDUCE"
-    # PROVIDER_HEALTH (recovery): the breaker has only just CLOSED again, on the strength of a few
-    # probe calls. Ramp volume back up linearly over recovery_ramp_s instead of releasing the whole
-    # backlog at once onto a provider that may still be fragile.
-    age = snap.breaker_age_s
-    if snap.breaker_state == "CLOSED" and age is not None and age < cfg.recovery_ramp_s and approved > 0:
-        frac = cfg.recovery_start_factor + (1 - cfg.recovery_start_factor) * age / cfg.recovery_ramp_s
-        ramped = max(1, math.floor(approved * frac))
-        if ramped < approved:
-            reasons.append("PROVIDER_HEALTH")
-            notes.append(f"breaker closed {age:.0f}s ago: ramping, {approved} x {frac:.2f} -> {ramped}")
-            approved = ramped
-            outcome = outcome if outcome == "FALLBACK_TO_PROGRESSIVE" else "REDUCE"
+    # RECOVERY_RAMP: after any period in which dialing was paused or held to a trickle (startup, a
+    # REJECT for EVENT_LAG / PROVIDER_HEALTH / calling window, HALF_OPEN probes, an AGENT_DROP
+    # cooldown), ramp volume back up linearly over recovery_ramp_s instead of releasing every
+    # waiting agent at once. A full release is what re-overloaded event delivery in the load test.
+    # mem["ramp_from"]: when the current ramp started; None (or missing, at startup) = restricted.
+    if "AGENT_DROP" in reasons or snap.breaker_state == "HALF_OPEN":
+        mem["ramp_from"] = None
+    else:
+        if mem.get("ramp_from") is None:
+            mem["ramp_from"] = now
+        age = now - mem["ramp_from"]
+        if age < cfg.recovery_ramp_s and approved > 0:
+            frac = cfg.recovery_start_factor + (1 - cfg.recovery_start_factor) * age / cfg.recovery_ramp_s
+            ramped = max(1, math.floor(approved * frac))
+            if ramped < approved:
+                reasons.append("RECOVERY_RAMP")
+                notes.append(f"dialing resumed {age:.0f}s ago: ramping, {approved} x {frac:.2f} -> {ramped}")
+                approved = ramped
+                outcome = outcome if outcome == "FALLBACK_TO_PROGRESSIVE" else "REDUCE"
+
+    # MAX_PER_TICK: no single decision releases more than this many calls, in any mode, progressive
+    # and COLD_START included. Bounds the burst that leaves in one tick (1,000 at once in the load
+    # test) whatever the other rules allow.
+    if approved > cfg.max_approved_per_tick:
+        reasons.append("MAX_PER_TICK")
+        notes.append(f"{approved} capped at {cfg.max_approved_per_tick} per tick")
+        approved = cfg.max_approved_per_tick
+        outcome = outcome if outcome == "FALLBACK_TO_PROGRESSIVE" else "REDUCE"
 
     return SafetyDecision(approved, mode, outcome, tuple(reasons), notes=tuple(notes)), mem
 

@@ -14,8 +14,13 @@ def pred(n, at=NOW):
     return PacingProposal(n, "PREDICTIVE", "test", at)
 
 
+# Rule memory of a campaign that has been dialing normally for a long time: no recovery ramp in
+# progress. Tests of other rules start here; the ramp tests below pass their own memory.
+STEADY = {"ramp_from": 0.0}
+
+
 def run(proposal, s, mem=None, cfg=CFG):
-    return decide(proposal, s, cfg, mem or {})
+    return decide(proposal, s, cfg, dict(STEADY) if mem is None else mem)
 
 
 def test_healthy_predictive_is_approved():
@@ -56,8 +61,9 @@ def test_cold_start_falls_back_to_progressive():
 def test_hard_ratio_cap():
     d, _ = run(pred(100), snap(available=10, unbound_in_flight=5))
     assert d.approved_calls == 25 - 5 and d.outcome == "REDUCE" and d.reason_codes == ("HARD_RATIO_CAP",)
-    d, _ = run(pred(1000), snap(available=1000, unbound_in_flight=0))
-    assert d.approved_calls == CFG.absolute_inflight_cap
+    # Absolute cap: 1,000 agents would allow 2,500, but only 500 may be in flight, and 480 already are.
+    d, _ = run(pred(1000), snap(available=1000, unbound_in_flight=CFG.absolute_inflight_cap - 20))
+    assert (d.approved_calls, d.reason_codes) == (20, ("HARD_RATIO_CAP",))
 
 
 def test_abandon_budget_with_hysteresis():
@@ -119,18 +125,67 @@ def test_pacer_cannot_switch_safety_off():
     assert d.approved_calls <= 2 and d.mode == "PROGRESSIVE"
 
 
-def test_recovery_ramp_after_breaker_closes():
-    """Just CLOSED after an outage: start at 20% of the approval and ramp linearly to 100% over 20 s."""
-    full = run(pred(20), snap(available=10, breaker_state="CLOSED", breaker_age_s=None))[0]
-    assert (full.approved_calls, full.reason_codes) == (20, ()), "never tripped: no ramp"
-    start = run(pred(20), snap(available=10, breaker_state="CLOSED", breaker_age_s=0.0))[0]
-    assert (start.outcome, start.approved_calls, start.reason_codes) == ("REDUCE", 4, ("PROVIDER_HEALTH",))
-    half = run(pred(20), snap(available=10, breaker_state="CLOSED", breaker_age_s=10.0))[0]
-    assert half.approved_calls == 12, "20 x (0.2 + 0.8 x 0.5)"
-    done = run(pred(20), snap(available=10, breaker_state="CLOSED", breaker_age_s=20.0))[0]
-    assert done.approved_calls == 20 and "PROVIDER_HEALTH" not in done.reason_codes
-    tiny = run(pred(1), snap(available=10, breaker_state="CLOSED", breaker_age_s=0.0))[0]
-    assert tiny.approved_calls == 1, "never ramps a nonzero approval down to zero"
+def _at(sec):
+    return NOW + timedelta(seconds=sec)
+
+
+def _step(n, mem, sec, mode="PREDICTIVE", **kw):
+    d, mem = decide(PacingProposal(n, mode, "test", _at(sec)), snap(taken_at=_at(sec), available=60, **kw), CFG, mem)
+    return d, mem
+
+
+def test_ramp_from_startup():
+    """A campaign's first decisions ramp 20% -> 100% over 20 s, then release in full."""
+    d, mem = _step(20, {}, 0)
+    assert (d.outcome, d.approved_calls, d.reason_codes) == ("REDUCE", 4, ("RECOVERY_RAMP",))
+    d, mem = _step(20, mem, 10)
+    assert d.approved_calls == 12, "20 x (0.2 + 0.8 x 0.5)"
+    d, mem = _step(20, mem, 20)
+    assert (d.approved_calls, d.reason_codes) == (20, ())
+    d, _ = _step(1, {}, 0)
+    assert d.approved_calls == 1, "never ramps a nonzero approval down to zero"
+
+
+def test_ramp_restarts_after_any_reject_that_paused_dialing():
+    for pause in (dict(event_lag_ms=5000), dict(breaker_state="OPEN"), dict(local_time=time(20, 0))):
+        d, mem = _step(20, dict(STEADY), 0, **pause)
+        assert d.outcome == "REJECT" and mem["ramp_from"] is None
+        d, mem = _step(20, mem, 1)
+        assert (d.approved_calls, d.reason_codes) == (4, ("RECOVERY_RAMP",)), pause
+
+
+def test_ramp_after_breaker_half_open_and_agent_drop():
+    d, mem = _step(20, dict(STEADY), 0, breaker_state="HALF_OPEN")
+    assert d.approved_calls == CFG.half_open_probes and mem["ramp_from"] is None, "probes only, no ramp yet"
+    d, mem = _step(20, mem, 1)
+    assert (d.approved_calls, d.reason_codes) == (4, ("RECOVERY_RAMP",)), "ramp starts when the breaker closes"
+
+    d, mem = _step(20, dict(STEADY), 0, staffed=50, max_staffed_recent=100)
+    assert "AGENT_DROP" in d.reason_codes and mem["ramp_from"] is None
+    d, mem = _step(20, mem, CFG.agent_drop_cooldown_s + 1, staffed=50, max_staffed_recent=50)
+    assert (d.mode, d.approved_calls, d.reason_codes) == ("PREDICTIVE", 4, ("RECOVERY_RAMP",)), "cooldown over: ramp"
+
+
+def test_void_decisions_do_not_restart_the_ramp():
+    """A stale or deposed-leader decision says nothing about whether dialing is safe."""
+    d, mem = decide(PacingProposal(20, "PREDICTIVE", "test", _at(-5)), snap(), CFG, dict(STEADY))
+    assert d.reason_codes == ("STALE_SNAPSHOT",) and mem["ramp_from"] == 0.0
+    d, mem = _step(20, mem, 0, leader_ok=False)
+    assert d.reason_codes == ("NOT_PACING_LEADER",) and mem["ramp_from"] == 0.0
+
+
+def test_per_tick_cap_in_every_mode():
+    """No decision approves more than max_approved_per_tick: predictive, progressive, COLD_START."""
+    cap = CFG.max_approved_per_tick
+    d, _ = run(pred(200), snap(available=200))
+    assert (d.outcome, d.approved_calls, d.reason_codes) == ("REDUCE", cap, ("MAX_PER_TICK",))
+    d, _ = run(PacingProposal(1000, "PROGRESSIVE", "test", NOW), snap(available=1000))
+    assert (d.approved_calls, d.reason_codes) == (cap, ("MAX_PER_TICK",))
+    d, _ = run(pred(1000), snap(available=1000, window_n=0, window_answered=0))
+    assert (d.outcome, d.approved_calls) == ("FALLBACK_TO_PROGRESSIVE", cap)
+    assert d.reason_codes == ("COLD_START", "MAX_PER_TICK")
+    d, _ = run(pred(30), snap(available=30), cfg=replace(CFG, max_approved_per_tick=10))
+    assert d.approved_calls == 10, "configurable"
 
 
 def test_calling_window_uses_the_injected_clock(conn, monkeypatch):

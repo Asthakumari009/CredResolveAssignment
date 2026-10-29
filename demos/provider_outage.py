@@ -109,7 +109,7 @@ def main():
         ramp = [r["approved_count"] for r in conn.execute(
             """SELECT approved_count FROM safety_decisions WHERE at > %s AND at < %s AND snapshot->>'breaker_state' = 'CLOSED'
                ORDER BY id LIMIT 8""", (outage_off, stall_on))]
-        print(f"  approvals after the breaker closed again (ramping from 20%): {ramp}")
+        print(f"  approvals after the breaker closed again (RECOVERY_RAMP from 20%): {ramp}")
         lag = conn.execute(
             """SELECT count(*) AS n, min(at) AS first, max(at) AS last, max((snapshot->>'event_lag_ms')::float) AS worst
                FROM safety_decisions WHERE at > %s AND 'EVENT_LAG' = ANY(reason_codes)""", (stall_off,)).fetchone()

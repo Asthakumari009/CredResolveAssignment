@@ -66,13 +66,13 @@ The scenarios are E (20% to 70%) and F (70% to 10%) in `sim/scenarios.py`. `make
 - **20% to 70% (dangerous direction):** pacing dialed for 20% and now 70% answer, so more people pick up than there
   are agents. Two defences, in order:
   1. HARD_RATIO_CAP (`safety_rules.decide`) caps unanswered in-flight calls at 2.5 x AVAILABLE agents now. As
-     answered calls take agents, AVAILABLE shrinks and the cap tightens on the very next tick. Measured: it
-     starts cutting 12 s after the jump.
-  2. ANSWER_RATE_DRIFT forces progressive once the short window has enough resolved calls. Measured: +44 s.
+     answered calls take agents, AVAILABLE shrinks and the cap tightens on the very next tick. Measured: the
+     first ratio cap or fallback comes 29 s after the jump.
+  2. ANSWER_RATE_DRIFT forces progressive once the short window has enough resolved calls. Measured: +51 s.
      The lag comes from the window counting only calls whose outcome is known (dial-time sampling over
      the resolved prefix, `safety/snapshot.load_snapshot`).
-  Result: 3 abandons out of 107 answered (2.8%) in the 5 minutes after the shock, under the 3% budget,
-  after which ABANDON_BUDGET would have forced progressive anyway. Contained, not prevented.
+  Result: 3 abandons out of 99 answered (3.0%) in the 5 minutes after the shock, right at the 3% budget,
+  where ABANDON_BUDGET forces progressive anyway. Contained, not prevented.
 
 ## 5. 1,000 to 100,000 agents. What breaks first?
 
@@ -87,10 +87,10 @@ From `docs/SCALING.md`, measured:
   which is too much for one campaign at low answer rates. 100,000 needs partitioning everywhere.
 - Fixed with batch claims (`SafetyController.claim_units` plus a `FOR KEY SHARE` pin per call). p50 reservation
   latency went from 18 to 4.6 ms, and throughput rose 28% to 77%. The new bottleneck is the pacing leader's tick cadence (it shares
-  a loop with dispatch and dials, so it ticks about every 640 ms at 8 workers instead of 250 ms) and then the claim
-  row itself. Throughput on the current code is about 86 reservations/s at 8 workers. At 16 and 32 workers the mock's webhook
-  delivery falls behind on the shared CPUs, answers arrive seconds late, and the EVENT_LAG rule holds dialing
-  (`docs/SCALING.md`).
+  a loop with dispatch and dials, so it ticks about every 444 ms at 8 workers instead of 250 ms) and then the claim
+  row itself. Throughput on the current code is about 103 reservations/s at 8 workers, held there on purpose by the
+  per-tick cap of 50 (50 per 444 ms tick). Runs above 8 workers measure the test harness, not the dialer: the mock
+  shares the same 8 CPUs (`docs/SCALING.md`).
 - Next fixes: a dedicated pacing loop, shard the permit, partition by campaign or
   agent pool, PgBouncer, a partitioned inbox, sharded provider health.
 - Adding servers alone makes it worse: more waiters on one lock, slower lock holders, and workers stuck
@@ -133,7 +133,7 @@ the predictive formula's N, reduced by whichever rule appears in `reason_codes`.
 
 ## 7. What part are you least confident about?
 
-- **Answer-rate drift detection lag (about 45 s).** The answer-rate window only counts resolved calls. No-answers
+- **Answer-rate drift detection lag (about 50 s).** The answer-rate window only counts resolved calls. No-answers
   take 30 s to resolve, so a jump in answer rate shows up late. The hard ratio cap carries the risk until then. An earlier
   signal from answers alone, which resolve in seconds, is the fix I would build next.
 - **The simulator and worker loops can drift** (ADR-6). They share every decision function but sequence them
@@ -161,19 +161,21 @@ the predictive formula's N, reduced by whichever rule appears in `reason_codes`.
   with EVENT_LAG rejecting 36 of 89, 106 of 135 and 116 of 122 decisions. At 32 workers it still loses most answers,
   for two reasons. The opening burst (1,796 approvals in 5 s) goes out before any event is late enough to see. And when
   the lag window clears, progressive releases all 1,000 available agents in one tick and overloads delivery again.
-  Fix (NOT BUILT): ramp approvals back up after EVENT_LAG clears, as the breaker does after recovery, and cap any
-  single approval so 1,000 dials never leave in one tick (`docs/SCALING.md`, "Late events").
+  Fixed (PLAN D18): RECOVERY_RAMP ramps approvals 20% to 100% over 20 s after startup or any pause in dialing,
+  and MAX_PER_TICK caps every decision at 50, progressive and COLD_START included. Rerun at 8 workers: abandon
+  rate 2.6% to 0.0%, EVENT_LAG rejects 36 to 0, ANSWERED delivery lag 1.2 s to 21 ms, throughput 86 to 103/s.
+  EVENT_LAG itself is still reactive; the ramp and the cap make it rarely needed (`docs/SCALING.md`, "Late events").
 - **Leader takeover.** For one tick around a takeover, the new leader's snapshot may not include the old
   leader's last consumed units. The hard cap bounds the overcount, but I have not measured it under load.
 
 ## 8. What would you do with one more week?
 
 1. **Fix the measured next bottleneck: pacing tick cadence (NOT BUILT).** After batch claims, the leader
-   ticks about every 640 ms at 8 workers instead of 250 ms. It is an ordinary worker, so dials (up to 3 s) and event
+   ticks about every 444 ms at 8 workers instead of 250 ms. It is an ordinary worker, so dials (up to 3 s) and event
    batches sit in front of its tick, and agents who free up wait for the next permit (`docs/SCALING.md`,
    "Now: what limits the current code"). The fix is a dedicated pacing loop: a thread or process that only runs
    `try_lead`, pacing and `SafetyController.decide`. Then shard the permit (SCALING fix 3) and rerun the
-   8/16/32 sweep. Not needed at 1,000 agents (at most about 37 dials/s against about 86/s measured), so it
+   8/16/32 sweep. Not needed at 1,000 agents (at most about 37 dials/s against about 103/s measured), so it
    was left out in the feature freeze.
 2. Early drift signal from answers only, and attribute abandons per provider so Provider B's event
    loss does not count against pacing.

@@ -81,7 +81,7 @@ invariant checks over the history tables and prints `RESULT: PASS` or `FAIL`.
 | Command | What it does |
 |---|---|
 | `make sim` | Simulator, scenarios A to F, progressive vs predictive, Provider A vs B. Writes `docs/SIMULATION_RESULTS.md` and `docs/img/` |
-| `make loadtest` | 1,000 agents, 50,000 borrowers, 8 workers, 60 s. `make loadtest ARGS="--workers 8 16 32"` for the sweep in `docs/SCALING.md` |
+| `make loadtest` | 1,000 agents, 50,000 borrowers, 8 workers, 60 s (`docs/SCALING.md`). More workers on one 8-CPU machine measure the harness, not the dialer |
 | `make psql` | psql into the dialer database |
 | `make shell` | bash in the app container |
 | `make down` | Stop and delete the database volume |

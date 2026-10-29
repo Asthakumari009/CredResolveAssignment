@@ -40,8 +40,9 @@ class CampaignSettings:
     agent_drop_cooldown_s: float = 30.0
     half_open_probes: int = 3
     degraded_factor: float = 0.5
-    recovery_ramp_s: float = 20.0           # after the breaker closes, ramp volume back up over this long
+    recovery_ramp_s: float = 20.0           # after startup or any pause in dialing, ramp volume back up over this long
     recovery_start_factor: float = 0.2      # ... starting from this fraction of what would be approved
+    max_approved_per_tick: int = 50         # no decision approves more calls than this, in any mode
     # Reconciliation (reaper)
     reconcile_pre_dial_s: float = 5.0       # pre-INITIATED longer than this: ask the provider
     reconcile_in_flight_s: float = 60.0     # INITIATED / RINGING with no news for this long
