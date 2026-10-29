@@ -25,11 +25,12 @@ class CampaignSettings:
     answer_window: int = 200
     short_window: int = 30
     drift_threshold: float = 0.15
-    drift_cooldown_s: float = 30.0
+    drift_z: float = 3.5
+    drift_cooldown_s: float = 15.0
     max_overdial_ratio: float = 2.5
     absolute_inflight_cap: int = 500
     abandon_window: int = 100
-    abandon_min_samples: int = 20
+    abandon_min_samples: int = 50   # below this, one abandon is >= 2% and would trip on noise
     abandon_threshold: float = 0.03
     abandon_resume: float = 0.015
     abandon_hysteresis_s: float = 60.0

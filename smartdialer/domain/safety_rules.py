@@ -117,20 +117,26 @@ def _fallback_reasons(snap: Snapshot, cfg: CampaignSettings, mem: dict, now: flo
         notes.append(f"abandon rate {rate:.1%} over last {snap.abandon_n} answered (trip {cfg.abandon_threshold:.0%},"
                      f" resume below {cfg.abandon_resume:.1%} for {cfg.abandon_hysteresis_s:.0f}s)")
 
-    # 4. AGENT_DROP: available agents fell sharply vs the recent max: stop overdialing for a cooldown.
-    if snap.max_available_recent and snap.available < (1 - cfg.agent_drop_pct) * snap.max_available_recent:
+    # 4. AGENT_DROP: staffed agents (logged in, not paused) fell sharply vs their recent max: people
+    # are leaving, so capacity estimates are about to be wrong. Stop overdialing for a cooldown.
+    # (Staffed, not AVAILABLE: available swings all the time as agents take calls.)
+    if snap.max_staffed_recent and snap.staffed < (1 - cfg.agent_drop_pct) * snap.max_staffed_recent:
         mem["agent_drop_until"] = now + cfg.agent_drop_cooldown_s
-        notes.append(f"available {snap.available} < {1 - cfg.agent_drop_pct:.0%} of recent max {snap.max_available_recent}")
+        notes.append(f"staffed agents {snap.staffed} < {1 - cfg.agent_drop_pct:.0%} of recent max {snap.max_staffed_recent}")
     if now < (mem.get("agent_drop_until") or 0):
         reasons.append("AGENT_DROP")
 
-    # 5. ANSWER_RATE_DRIFT: recent answer rate disagrees with the long window, so the estimate is stale.
+    # 5. ANSWER_RATE_DRIFT: recent answer rate disagrees with the long window, so the estimate is
+    # stale. Must be both large (> drift_threshold) and statistically real (|z| >= drift_z): a
+    # 30-call window at p = 0.3 has a standard error of ~0.08, so a fixed gap alone fires on noise.
     if snap.short_n >= cfg.short_window and snap.window_n:
         p_short = snap.short_answered / snap.short_n
         p_long = snap.window_answered / snap.window_n
-        if abs(p_short - p_long) > cfg.drift_threshold:
+        se = math.sqrt(max(p_long * (1 - p_long), 0.01) / snap.short_n)
+        z = (p_short - p_long) / se
+        if abs(p_short - p_long) > cfg.drift_threshold and abs(z) >= cfg.drift_z:
             mem["drift_until"] = now + cfg.drift_cooldown_s
-            notes.append(f"short-window p={p_short:.2f} vs long-window p={p_long:.2f}")
+            notes.append(f"short-window p={p_short:.2f} vs long-window p={p_long:.2f} (z={z:+.1f})")
     if now < (mem.get("drift_until") or 0):
         reasons.append("ANSWER_RATE_DRIFT")
     return reasons

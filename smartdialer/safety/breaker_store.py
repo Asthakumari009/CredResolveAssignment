@@ -6,6 +6,9 @@ dial attempt. Note for scale: one row per provider is a write hotspot (see docs/
 """
 from smartdialer.domain.breaker import next_state
 
+# The last N decided dial attempts (count-based, not time-based: after an outage starts, new dials
+# slow to a trickle, and a time window would let the many successes from just before the outage
+# drown out the failures).
 _OUTCOMES = """
 SELECT count(*) FILTER (WHERE ok) AS ok, count(*) FILTER (WHERE NOT ok) AS fail
 FROM (SELECT (provider_call_id IS NOT NULL OR dialed_at IS NOT NULL) AS ok
@@ -15,8 +18,10 @@ FROM (SELECT (provider_call_id IS NOT NULL OR dialed_at IS NOT NULL) AS ok
         -- a dial still waiting for its response is neither success nor failure yet
         AND (provider_call_id IS NOT NULL OR dialed_at IS NOT NULL
              OR state = 'FAILED' AND failure_reason IN ('TIMEOUT','PROVIDER_ERROR')
-             OR state IN ('QUEUED','RESERVED') AND created_at < now() - interval '3.5 seconds')) x
+             OR state IN ('QUEUED','RESERVED') AND created_at < now() - interval '3.5 seconds')
+      ORDER BY created_at DESC LIMIT %(n)s) x
 """
+WINDOW = 20
 
 
 def evaluate(conn, campaign_id: int) -> str:
@@ -27,8 +32,11 @@ def evaluate(conn, campaign_id: int) -> str:
                WHERE c.id = %s FOR UPDATE OF h""", (campaign_id,)).fetchone()
         if h is None:
             return "CLOSED"
-        recent = conn.execute(_OUTCOMES, {"p": h["provider_name"], "since": _ago(conn, 30)}).fetchone()
-        probe = (conn.execute(_OUTCOMES, {"p": h["provider_name"], "since": h["opened_at"]}).fetchone()
+        # Judge only attempts made since the last state change, so a freshly CLOSED breaker is not
+        # re-opened by the very failures that opened it.
+        since = max(_ago(conn, 120), h["opened_at"] or _ago(conn, 120))
+        recent = conn.execute(_OUTCOMES, {"p": h["provider_name"], "since": since, "n": WINDOW}).fetchone()
+        probe = (conn.execute(_OUTCOMES, {"p": h["provider_name"], "since": h["opened_at"], "n": 1000}).fetchone()
                  if h["breaker_state"] == "HALF_OPEN" else {"ok": 0, "fail": 0})
         new = next_state(h["breaker_state"], float(h["since_s"] or 0), float(h["now_s"]),
                          recent["ok"], recent["fail"], probe["ok"], probe["fail"])

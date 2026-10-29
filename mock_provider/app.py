@@ -39,14 +39,15 @@ class Profile:
     ring_s: tuple[float, float] = (2.0, 8.0)
     talk_mean_s: float = 120.0
     time_scale: float = 0.02
-    outage: bool = False
+    outage: bool = False         # API down: dial / status / hangup hang past any client timeout
+    webhooks_down: bool = False  # event delivery stalls (events arrive late, after it clears)
     auto_events: bool = True     # False: accept dials but send no events (demos craft them)
     seed: int | None = None
 
 
 PROFILES = {
     "a": Profile(latency_ms=(50, 150), error_rate=0.01, timeout_rate=0.0, duplicate_rate=0.0, reorder_rate=0.0, drop_rate=0.0),
-    "b": Profile(latency_ms=(300, 2000), error_rate=0.0, timeout_rate=0.08, duplicate_rate=0.15, reorder_rate=0.20, drop_rate=0.05),
+    "b": Profile(latency_ms=(300, 2000), error_rate=0.0, timeout_rate=0.08, duplicate_rate=0.15, reorder_rate=0.20, drop_rate=0.02),
 }
 DEFAULTS = {k: replace(v) for k, v in PROFILES.items()}
 
@@ -215,7 +216,7 @@ async def _event(p: str, prof: Profile, call: MockCall, etype: str, final: bool 
         "type": etype, "seq": call.seq, "ts": datetime.now(timezone.utc).isoformat(),
         "duration_s": call.duration_s if final else None,
     }
-    delay = RNG.uniform(0.5, 3.0) * prof.time_scale * 50 if RNG.random() < prof.reorder_rate else 0.0
+    delay = RNG.uniform(0.1, 1.0) if RNG.random() < prof.reorder_rate else 0.0   # real seconds, not scaled
     asyncio.create_task(_deliver(p, payload, delay))
     if RNG.random() < prof.duplicate_rate:
         dup = payload if RNG.random() < 0.7 else {**payload, "event_id": uuid.uuid4().hex}   # same id, or a new id
@@ -225,6 +226,8 @@ async def _event(p: str, prof: Profile, call: MockCall, etype: str, final: bool 
 async def _deliver(p: str, payload: dict, delay: float):
     if delay:
         await asyncio.sleep(delay)
+    while PROFILES[p].webhooks_down:
+        await asyncio.sleep(0.2)
     for attempt in range(5):   # at-least-once delivery, like real providers
         try:
             r = await http.post(f"{WEBHOOK_URL}/{p.upper()}", json=payload)

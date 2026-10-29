@@ -17,6 +17,7 @@ Never redial blindly: a new dial would use a new call id, and the borrower could
 """
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from smartdialer.config import CampaignSettings
 from smartdialer.providers.interface import ProviderUnavailable
@@ -24,6 +25,7 @@ from smartdialer.transitions import advance_call, set_agent_state
 
 log = logging.getLogger(__name__)
 D = CampaignSettings()
+_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="reconcile")   # HTTP only, no DB in threads
 
 
 def reconcile_calls(conn, providers: dict, worker_id: str, limit: int = 50) -> list[tuple[str, str]]:
@@ -51,21 +53,31 @@ def reconcile_calls(conn, providers: dict, worker_id: str, limit: int = 50) -> l
         {"pre": D.reconcile_pre_dial_s, "fly": D.reconcile_in_flight_s, "con": D.reconcile_connected_s,
          "give_up": D.reconcile_give_up_s, "limit": limit}).fetchall()
 
-    done = []
-    for c in claimed:
-        provider = providers.get(c["provider_name"])
-        if provider is None:
-            continue
+    # The circuit breaker covers status polls too: while a provider is OPEN, do not hammer it.
+    open_providers = {r["provider_name"] for r in conn.execute(
+        "SELECT provider_name FROM provider_health WHERE breaker_state = 'OPEN'")}
+
+    def poll(c):
+        if c["provider_name"] in open_providers or c["provider_name"] not in providers:
+            return c, ProviderUnavailable("circuit open")
         try:
-            st = provider.get_call_status(str(c["id"]))
+            return c, providers[c["provider_name"]].get_call_status(str(c["id"]))
+        except ProviderUnavailable as e:
+            return c, e
+
+    done = []
+    # Polls run in parallel: during an outage each one waits for the full client timeout, and
+    # polling 50 calls one by one would freeze this worker for minutes.
+    for c, st in _POOL.map(poll, claimed):
+        if isinstance(st, ProviderUnavailable):
+            if c["stuck_s"] < c["give_up_s"] or c["state"] == "CONNECTED":
+                log.info("reconcile %s: provider unavailable (%s), will retry", c["id"], st)
+                continue
+            st, etype = None, "TIMEOUT"   # ponytail: may orphan a call the provider did place; see INTERVIEW_PREP
+        else:
             etype = st.status
             if etype == "NOT_FOUND" and c["state"] not in ("QUEUED", "RESERVED"):
                 etype = "FAILED"   # we know it was dialed, but the provider lost it
-        except ProviderUnavailable as e:
-            if c["stuck_s"] < c["give_up_s"] or c["state"] == "CONNECTED":
-                log.info("reconcile %s: provider unavailable (%s), will retry", c["id"], e)
-                continue
-            st, etype = None, "TIMEOUT"   # ponytail: may orphan a call the provider did place; see INTERVIEW_PREP
         conn.execute(
             """INSERT INTO provider_events (provider_name, provider_event_id, call_id, provider_call_id, event_type, payload)
                VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (provider_name, provider_event_id) DO NOTHING""",

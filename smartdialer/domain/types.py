@@ -14,6 +14,7 @@ class Snapshot:
     breaker_state: str
     # agents
     available: int
+    staffed: int                # logged in and not paused (any state but OFFLINE / PAUSED)
     wrap_up: int
     bound_agents: int
     # live calls
@@ -32,7 +33,7 @@ class Snapshot:
     abandon_count: int
     avg_setup_s: float | None
     avg_talk_s: float | None
-    max_available_recent: int   # highest `available` seen in recent decisions (agent-drop rule)
+    max_staffed_recent: int     # highest `staffed` seen in recent decisions (agent-drop rule)
 
     def to_json(self) -> dict:
         d = asdict(self)

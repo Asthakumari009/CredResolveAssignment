@@ -72,6 +72,44 @@ def test_out_of_order_completed_answered_ringing(conn):
     assert conn.execute("SELECT state FROM agents").fetchone()["state"] == "AVAILABLE"
 
 
+def _post_seq(conn, call_id, etype, seq, duration_s=None, age_ms=0):
+    conn.execute(
+        """INSERT INTO provider_events (provider_name, provider_event_id, call_id, event_type, sequence, payload, received_at, next_attempt_at)
+           VALUES ('A', %s, %s, %s, %s, %s, now() - %s * interval '1 millisecond', now() - %s * interval '1 millisecond')""",
+        (uuid.uuid4().hex, call_id, etype, seq, json.dumps({"duration_s": duration_s}), age_ms, age_ms))
+
+
+def test_resequencing_recovers_a_late_answered(conn):
+    """Provider numbers events. COMPLETED (seq 3) arrives before ANSWERED (seq 2) and RINGING (seq 1)
+    is lost. Within the hold window the gap fills: the call is CONNECTED then COMPLETED, no false abandon."""
+    call = _one_call(conn)
+    _post_seq(conn, call, "COMPLETED", 3, duration_s=50)
+    process_batch(conn, "w")
+    assert conn.execute("SELECT state FROM calls").fetchone()["state"] == "INITIATED", "held: waiting for seq 2"
+    _post_seq(conn, call, "ANSWERED", 2, age_ms=2000)   # arrived a while ago: ANSWERED's own hold has expired
+    conn.execute("UPDATE provider_events SET next_attempt_at = now()")
+    process_batch(conn, "w")
+    assert transitions(conn, call)[-3:] == ["ANSWERED", "CONNECTED", "COMPLETED"]
+    assert conn.execute("SELECT last_outcome FROM borrowers").fetchone()["last_outcome"] == "CONNECTED"
+
+
+def test_resequencing_gives_up_after_window(conn):
+    call = _one_call(conn)
+    _post_seq(conn, call, "COMPLETED", 3, duration_s=50, age_ms=2000)
+    process_batch(conn, "w")
+    assert conn.execute("SELECT state FROM calls").fetchone()["state"] == "COMPLETED"
+
+
+def test_per_call_fifo_older_event_first(conn):
+    call = _one_call(conn)
+    post(conn, call, "ANSWERED")
+    post(conn, call, "COMPLETED", duration_s=10)
+    # make the newer event look due first: the per-call ordering must still apply ANSWERED first
+    conn.execute("UPDATE provider_events SET next_attempt_at = now() - interval '1 hour' WHERE event_type = 'COMPLETED'")
+    ev = process_one(conn, "w")
+    assert ev["event_type"] == "ANSWERED"
+
+
 def test_failure_after_answer_is_rejected_not_applied(conn):
     call = _one_call(conn)
     post(conn, call, "ANSWERED")

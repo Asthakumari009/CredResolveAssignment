@@ -71,7 +71,10 @@ def services():
         for p in procs:
             p.terminate()
         for p in procs:
-            p.wait(timeout=10)
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()   # requests stuck in a simulated outage keep uvicorn from exiting cleanly
 
 
 def start_worker(worker_id: str, crash_at: str | None = None, seconds: float = 120) -> subprocess.Popen:
