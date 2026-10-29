@@ -16,12 +16,8 @@ import time
 from demos.common import control, fresh_db, finish, header, say, services, start_worker, stop, wait_for
 from demos.setup import campaign
 
-# The mock runs calls at 1/20 speed with exponential talk time, so about one answered call in five
-# hangs up within half a real second, before any worker has applied ANSWERED. Those are counted as
-# abandons (correctly), and the abandon budget would throttle dialing so hard that the breaker
-# never sees enough attempts. This demo is about the breaker, so the abandon budget is lifted here.
 SETTINGS = {"reconcile_pre_dial_s": 4, "reconcile_in_flight_s": 6, "reconcile_give_up_s": 15,
-            "retry_base_s": 3, "max_attempts": 5, "abandon_threshold": 1.0}
+            "retry_base_s": 3, "max_attempts": 5}
 
 
 def sample(conn, t0):
