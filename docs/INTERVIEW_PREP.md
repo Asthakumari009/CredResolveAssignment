@@ -77,8 +77,9 @@ From `docs/SCALING.md`, measured:
   transaction, so the campaign's permit row was locked through the whole transaction. Dispatch per campaign was serial,
   with a ceiling of about 110 to 120 reservations/s. Going from 16 to 32 workers *dropped* throughput from 123/s to 78/s, and
   every sampled lock wait was on that row.
-- Real traffic is about 0.011 to 0.03 dials/s per agent, so 1,000 agents in one campaign is fine (about 30/s),
-  10,000 in one campaign is not (about 300/s), and 100,000 needs partitioning everywhere.
+- Real traffic depends on the answer rate: `dials/s = N x U / (p x (T_talk + T_wrap))`. For 1,000 agents at full
+  utilization that is 7.3 (scenario C) to 37 (scenario A) dials/s, which is fine in one campaign. 10,000 agents is 73 to 370/s,
+  which is too much for one campaign at low answer rates. 100,000 needs partitioning everywhere.
 - Fixed with batch claims (`SafetyController.claim_units` plus a `FOR KEY SHARE` pin per call). p50 reservation
   latency went from 18 to 4.6 ms, and throughput rose 28% to 77%. The new bottleneck is the pacing leader's tick cadence (it shares
   a loop with dispatch and dials, so it ticks every 340 to 570 ms instead of 250) and then the claim row itself.
@@ -142,7 +143,7 @@ the predictive formula's N, reduced by whichever rule appears in `reason_codes`.
    batches sit in front of its tick, and agents who free up wait for the next permit (`docs/SCALING.md`,
    "After: what is the bottleneck now"). The fix is a dedicated pacing loop: a thread or process that only runs
    `try_lead`, pacing and `SafetyController.decide`. Then shard the permit (SCALING fix 3) and rerun the
-   8/16/32 sweep. Not needed at 1,000 agents (about 30 dials/s against about 160/s measured), so it
+   8/16/32 sweep. Not needed at 1,000 agents (at most about 37 dials/s against about 160/s measured), so it
    was left out in the feature freeze.
 2. Early drift signal from answers only, and attribute abandons per provider so Provider B's event
    loss does not count against pacing.

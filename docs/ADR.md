@@ -86,10 +86,11 @@ Format for each: **Chosen**, **Why**, **Problem it solves**, **What it makes har
   of calls, not a column. The 2 s expiry means a slow leader starves dispatch rather than overdials.
   That is the right failure direction.
 - **Honest note: batching was not needed at the assignment's scale.** At 1,000 agents the system needs
-  roughly 30 to 33 dials/s (`SCALING.md`: about 0.011 dials/s per agent progressive, about 0.03 at the
-  predictive cap). The pre-batching design (one permit unit consumed inside each call transaction)
-  measured about 115 reservations/s per campaign, already more than three times that. Batching was a deliberate step toward
-  larger single campaigns (10,000 agents is 110 to 300 dials/s). It bought real headroom: p50
+  `dials/s = N x U / (p x (T_talk + T_wrap))`, which depends on the answer rate p (`SCALING.md`). With the
+  simulator's scenarios, at full utilization: A (20%, 120 s talk) 37.0, B (50%, 90 s) 19.0, C (70%, 180 s) 7.3
+  dials/s, so at most about 37. The pre-batching design (one permit unit consumed inside each call transaction)
+  measured about 115 reservations/s per campaign, about three times even scenario A. Batching was a deliberate
+  step toward larger single campaigns (10,000 agents is 73 to 370 dials/s by the same formula). It bought real headroom: p50
   reservation latency went from 18 to 4.6 ms, and throughput rose 28 to 77%. It also added real complexity that
   the simpler design did not need:
   per-call pins (`FOR KEY SHARE`), the two-step retire-then-wait revoke in `decide`, deduct-before-commit

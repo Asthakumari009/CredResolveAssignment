@@ -122,16 +122,35 @@ processes behind it.
 
 ## 100, 1,000, 10,000 agents
 
-Real traffic is much lighter than the load test. A progressive agent with about 25 s of ringing, 30% answer
-rate and about 3.5 minutes of talk plus wrap-up makes about one dial per 90 s, roughly 0.011 dials/s.
-Predictive at its 2.5x hard cap makes about 0.03 dials/s. Each call produces 3 to 4 inbox events.
+Real traffic is much lighter than the load test, and how much lighter depends on the answer rate.
+Every connected call occupies an agent for talk plus wrap-up, and only a fraction p of dials connect. So
+the dial rate needed to keep N agents busy at utilization U is:
 
-| Agents | Dials/s (progressive to predictive cap) | Inbox events/s | What breaks first |
+```
+dials/s = N x U / (p x (T_talk + T_wrap))
+```
+
+With U = 100% this is the upper bound, which is what a perfect predictive dialer would need. Unanswered calls do not appear in the
+formula because they ring without occupying an agent (predictive); in progressive mode they do occupy
+one, which lowers U and therefore the dial rate. For 1,000 agents, with the simulator's scenarios
+(`sim/scenarios.py`, wrap-up 15 s):
+
+| Scenario | p | T_talk | dials/s at U = 100% (upper bound) | dials/s at the simulator's measured predictive U |
+|---|---|---|---|---|
+| A | 20% | 120 s | 1000 / (0.20 x 135) = **37.0** | 37.0 x 64.7% = 24.0 |
+| B | 50% | 90 s | 1000 / (0.50 x 105) = **19.0** | 19.0 x 70.4% = 13.4 |
+| C | 70% | 180 s | 1000 / (0.70 x 195) = **7.3** | 7.3 x 88.2% = 6.5 |
+
+So 1,000 agents need **at most about 37 dials/s**, at the lowest answer rate (A), and the rate scales linearly
+with N. Each dial produces 3 to 4 inbox events. Measured per-campaign throughput: about 115 reservations/s before batch
+claims, 140 to 170/s after.
+
+| Agents | Dials/s (C to A, upper bound) | Inbox events/s | What breaks first |
 |---|---|---|---|
-| 100 | 1 to 3 | about 10 | Nothing. One worker is enough; more workers are for crash tolerance |
-| 1,000 | 11 to 30 | about 100 | Nothing in one campaign: 30/s is a fifth of the measured per-campaign throughput. The `provider_health` row (C5) and the per-tick snapshot query start to show up if there are many campaigns |
-| 10,000 | 110 to 300 | about 1,000 | **Per-campaign permit supply**, if those agents are in one campaign: 300/s is about 2x the measured 140 to 170/s (pacing tick cadence, then the claim row). Next: inbox write volume and connection count as workers grow |
-| 100,000 | 1,100 to 3,000 | about 10,000 | Single Postgres write throughput for transitions plus inbox, connection count, and the inbox table size |
+| 100 | 0.7 to 3.7 | up to about 13 | Nothing. One worker is enough; more workers are for crash tolerance |
+| 1,000 | 7 to 37 | up to about 130 | Nothing in one campaign: 37/s is under a third of even the pre-batching throughput. The `provider_health` row (C5) and the per-tick snapshot query start to show up if there are many campaigns |
+| 10,000 | 73 to 370 | up to about 1,300 | **Per-campaign permit supply**, if those agents are in one campaign at a low answer rate: A needs 370/s and B 190/s, against 140 to 170/s measured (pacing tick cadence, then the claim row). C (73/s) fits. Next: inbox write volume and connection count as workers grow |
+| 100,000 | 730 to 3,700 | up to about 13,000 | Single Postgres write throughput for transitions plus inbox, connection count, and the inbox table size |
 
 ## Fixes, in the order I would apply them
 
