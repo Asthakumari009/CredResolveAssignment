@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: dialer
+      POSTGRES_PASSWORD: dialer
+      POSTGRES_DB: dialer
+    # Load test runs many worker processes, each with its own connection.
+    command: postgres -c max_connections=400 -c shared_buffers=256MB
+    ports:
+      - "55432:5432"   # only for poking at it from the host; all Python runs in the app container
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dialer -d dialer"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://dialer:dialer@db:5432/dialer
+      TEST_DATABASE_URL: postgresql://dialer:dialer@db:5432/dialer_test
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    # Every Python entry point (tests, demos, sim, loadtest) is `docker compose run --rm app <cmd>`.
+    command: ["python", "-m", "smartdialer.migrate"]
