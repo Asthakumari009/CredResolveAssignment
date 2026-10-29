@@ -138,6 +138,11 @@ the predictive formula's N, reduced by whichever rule appears in `reason_codes`.
 - **The reconcile give-up (TIMEOUT).** After `reconcile_give_up_s` of an unreachable provider, the call is marked
   FAILED even though the provider may have placed it. It is safe for agents and borrowers (late events are
   STALE_IGNORED), but the attempt count can be wrong by one.
+- **The breaker goes blind at low traffic (NOT BUILT).** It judges only live call outcomes. If dialing is
+  throttled for another reason (the abandon budget forcing 1 call per tick, a small campaign, night hours),
+  the window of 20 attempts never fills and the breaker stays CLOSED through an outage. Seen in the
+  provider_outage demo. Fix: a minimum volume before judging (report UNKNOWN, handled like DEGRADED), or an
+  active health probe per provider feeding the same window (`docs/SCALING.md`, fix 10).
 - **Leader takeover.** For one tick around a takeover, the new leader's snapshot may not include the old
   leader's last consumed units. The hard cap bounds the overcount, but I have not measured it under load.
 

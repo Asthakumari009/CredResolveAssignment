@@ -11,13 +11,12 @@ from smartdialer.safety.controller import SafetyController
 from smartdialer.safety.leader import try_lead
 from smartdialer.safety.snapshot import load_snapshot
 from demos.common import MOCK_URL, say
-
-ALWAYS_OPEN = {"window_start": "00:00", "window_end": "00:00"}
+from tests.helpers import midday_timezone
 
 
 def campaign(conn, *, mode="PROGRESSIVE", provider="A", agents=1, borrowers=1, settings=None) -> int:
-    cid = conn.execute("INSERT INTO campaigns (name, mode, provider_name, settings) VALUES ('demo', %s, %s, %s) RETURNING id",
-                       (mode, provider, json.dumps({**ALWAYS_OPEN, **(settings or {})}))).fetchone()["id"]
+    cid = conn.execute("INSERT INTO campaigns (name, mode, provider_name, settings, timezone) VALUES ('demo', %s, %s, %s, %s) RETURNING id",
+                       (mode, provider, json.dumps(settings or {}), midday_timezone())).fetchone()["id"]
     conn.execute("INSERT INTO agents (campaign_id, name) SELECT %s, 'agent-' || g FROM generate_series(1, %s) g", (cid, agents))
     conn.execute("INSERT INTO borrowers (campaign_id, phone) SELECT %s, '+91 98' || lpad(g::text, 8, '0') FROM generate_series(1, %s) g",
                  (cid, borrowers))

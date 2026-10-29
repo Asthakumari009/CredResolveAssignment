@@ -10,7 +10,9 @@ Each call's fate (answered or not, talk time) is drawn at dial time from the sce
 are POSTed to the webhook (WEBHOOK_URL/{p}). Provider B misbehaves on purpose: slow, timeouts
 (the call IS placed but the response arrives after the client gave up), duplicate events,
 reordering, and dropped intermediate events. All durations are multiplied by time_scale so a
-120 s call can run in a couple of real seconds; reported durations are the unscaled ones.
+120 s call can run in a couple of real seconds; reported durations are the unscaled ones. Talk
+time has a real-time floor (min_talk_real_s), so a borrower never hangs up faster than a dialer
+could bridge them unless a scenario asks for it.
 """
 import asyncio
 import os
@@ -40,6 +42,11 @@ class Profile:
     ring_s: tuple[float, float] = (2.0, 8.0)
     talk_mean_s: float = 120.0
     time_scale: float = 0.02
+    # Answered calls last at least this long in REAL seconds, whatever time_scale is. Without it a
+    # compressed exponential talk time makes ~1 in 5 borrowers hang up before any worker could
+    # apply ANSWERED (hold 2 s + resequencing 1.5 s + worker pass), and those are real abandons.
+    # A scenario that wants instant hang-ups sets this to 0 explicitly.
+    min_talk_real_s: float = 6.0
     outage: bool = False         # API down: dial / status / hangup hang past any client timeout
     webhooks_down: bool = False  # event delivery stalls (events arrive late, after it clears)
     auto_events: bool = True     # False: accept dials but send no events (demos craft them)
@@ -194,7 +201,7 @@ async def _lifecycle(p: str, prof: Profile, call: MockCall):
         await asyncio.sleep(ring * s)
         call.answered_at = asyncio.get_running_loop().time()
         await _event(p, prof, call, "ANSWERED")
-        talk = RNG.expovariate(1 / prof.talk_mean_s)
+        talk = max(RNG.expovariate(1 / prof.talk_mean_s), prof.min_talk_real_s / s)
         await asyncio.sleep(talk * s)
         await _finish(p, prof, call, "COMPLETED", round(talk, 1))
     elif r < prof.answer_rate + prof.busy_rate:

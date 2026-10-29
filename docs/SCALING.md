@@ -187,3 +187,11 @@ claims, 140 to 170/s after.
 9. **Snapshot query.** It aggregates over the campaign's recent calls on every tick. At 10,000 agents
    in one campaign, keep running counters per campaign (updated in the transition transaction), or
    read from a replica with the staleness rule (STALE_SNAPSHOT) already in place.
+10. **A breaker that can see at low traffic. NOT BUILT.** Finding from the provider_outage demo: the
+   breaker is driven only by live call outcomes (the last 20 attempts since its last state change).
+   When something else throttles dialing, for example the abandon budget forcing progressive at 1 call
+   per tick, too few attempts reach the provider to fill the window, and the breaker stays CLOSED
+   through an outage it cannot see. Low volume is exactly when it goes blind. Proposed fix: a minimum
+   volume before judging (below N attempts, report UNKNOWN, not CLOSED, and treat UNKNOWN like DEGRADED),
+   or an active health probe (a cheap periodic status call per provider, fed into the same window), so
+   provider health no longer depends on how much the dialer happens to be dialing.
