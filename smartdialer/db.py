@@ -9,8 +9,9 @@ LOCK ORDER (used by every transaction that locks more than one of these rows):
 
     campaign / permit / inbox event  ->  call  ->  borrower  ->  agent
 
-(dispatch takes permit -> borrower -> agent and then inserts a brand-new call row; the event
-processor takes inbox event -> call -> borrower -> agent.)
+(dispatch pins the permit FOR KEY SHARE -> borrower -> agent and then inserts a brand-new call
+row; claiming permit units is a separate one-statement transaction; the Safety Controller takes
+campaign -> permit; the event processor takes inbox event -> call -> borrower -> agent.)
 
 Two transactions taking the same rows in opposite orders could deadlock. Postgres would
 detect that and abort one of them, so it would not corrupt data, but under load it turns

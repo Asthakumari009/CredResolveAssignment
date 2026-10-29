@@ -1,8 +1,12 @@
 """Safety Controller: the only component that can create dial permits.
 
-A permit is a row in dial_permits: approved_count, consumed_count, a short expiry, and the
-campaign fencing token. The allocator can only create a call by consuming one unit of the
-current permit, in the same transaction that creates the call. There is no other path.
+A permit is a row in dial_permits: approved_count, consumed_count (units CLAIMED by workers),
+a short expiry, and the campaign fencing token. Workers claim units in small batches with one
+short statement (claim_units), then spend them one call at a time. Each call transaction
+first pins the permit (pin) and only creates the call if the permit is still live.
+
+Claimed units that never become calls are dropped, never returned: calls <= claimed <= approved.
+Dropping can only mean fewer calls than approved, never more (ADR-4).
 """
 import json
 
@@ -18,20 +22,30 @@ class SafetyController:
 
     def decide(self, conn, campaign_id: int, fencing_token: int, proposal: PacingProposal) -> SafetyDecision:
         cfg = load_settings(conn, campaign_id)
+        # Step 1, its own short transaction: retire the live permit, so from now on no call
+        # transaction can pin it. Leader-only (same test as the snapshot's leader_ok): a
+        # deposed leader or an impostor cannot retire the real leader's permit.
+        retired = [r["id"] for r in conn.execute(
+            """UPDATE dial_permits p SET revoked = true FROM campaigns c
+               WHERE p.campaign_id = %(c)s AND c.id = p.campaign_id AND NOT p.revoked
+                 AND c.fencing_token = %(t)s
+                 AND c.pacing_lease_owner = %(w)s AND c.pacing_lease_expires_at > now()
+               RETURNING p.id""", {"c": campaign_id, "t": fencing_token, "w": self.worker_id})]
         with conn.transaction():
             # LOCK ORDER: campaign -> permit. Holding the campaign row serializes deciders.
-            # CONCURRENCY: FOR NO KEY UPDATE, not FOR UPDATE. Consumers hold the permit row and then
-            # insert a call, whose foreign key check takes KEY SHARE on this campaign row. FOR UPDATE
-            # blocks KEY SHARE, so decider (campaign, waiting on permit) and consumer (permit, waiting
-            # on campaign) deadlocked under load. NO KEY UPDATE still excludes other deciders.
+            # CONCURRENCY: FOR NO KEY UPDATE, not FOR UPDATE. Call transactions hold the permit and
+            # then insert a call, whose foreign key check takes KEY SHARE on this campaign row, while
+            # we wait on that permit below. FOR UPDATE blocks KEY SHARE: that deadlocked under load
+            # (PLAN D10). NO KEY UPDATE allows KEY SHARE and still excludes other deciders.
             camp = conn.execute("SELECT safety_state FROM campaigns WHERE id = %s FOR NO KEY UPDATE",
                                 (campaign_id,)).fetchone()
+            # CONCURRENCY: call transactions hold the permit FOR KEY SHARE (see pin) from their
+            # validity check until commit. FOR UPDATE waits for exactly those that pinned before
+            # step 1 committed; none can pin after it. So the snapshot below counts every call
+            # the retired permit will ever produce. The waiter set is finite: no starvation.
+            if retired:
+                conn.execute("SELECT id FROM dial_permits WHERE id = ANY(%s) FOR UPDATE", (retired,))
             snap = load_snapshot(conn, campaign_id, cfg, self.worker_id, fencing_token)
-            if snap.leader_ok:
-                # Revoke first, then re-read: the revoke waits for any in-flight consume of the old
-                # permit to commit, so the fresh snapshot below already counts those calls.
-                conn.execute("UPDATE dial_permits SET revoked = true WHERE campaign_id = %s AND NOT revoked", (campaign_id,))
-                snap = load_snapshot(conn, campaign_id, cfg, self.worker_id, fencing_token)
             decision, memory = safety_rules.decide(proposal, snap, cfg, camp["safety_state"])
 
             explanation = proposal.explanation + (" | " + "; ".join(decision.notes) if decision.notes else "")
@@ -55,23 +69,45 @@ class SafetyController:
                               permit_id, decision_id, decision.notes)
 
     @staticmethod
-    def consume_one(conn, campaign_id: int):
-        """Take one unit of the campaign's live permit. Must run inside the caller's transaction,
-        the same one that creates the call, so a rollback gives the unit back.
+    def claim_units(conn, campaign_id: int, want: int):
+        """Claim up to `want` units of the campaign's live permit. Returns
+        {"id", "mode", "units"} or None. Run OUTSIDE any transaction: each attempt is one
+        autocommit statement, so the permit row lock is held for that statement only, never
+        while a borrower or agent is being reserved.
 
-        # CONCURRENCY: many workers consume the same permit row. The UPDATE takes the row lock;
-        # a concurrent consumer waits, then Postgres re-evaluates the WHERE clause against the
-        # updated row, so `consumed_count < approved_count` is checked on the latest value and
-        # the permit can never be over-consumed (and the CHECK constraint backs this up).
-        # revoked, expires_at and the fencing token are checked in the same statement, so a
-        # revoked, expired, or deposed-leader permit yields 0 rows.
+        # CONCURRENCY: many workers claim from the same row. The UPDATE takes the row lock; a
+        # concurrent claimer waits, then Postgres re-evaluates the WHERE clause on the updated
+        # row, so `consumed_count + k <= approved_count` is checked on the latest value. Units
+        # are never over-claimed (and the CHECK constraint backs this up). revoked, expires_at
+        # and the fencing token are checked in the same statement. If k does not fit, try a
+        # smaller k, down to 1.
+        """
+        k = max(1, want)
+        while k >= 1:
+            row = conn.execute(
+                """UPDATE dial_permits p SET consumed_count = p.consumed_count + %(k)s
+                   FROM campaigns c
+                   WHERE p.campaign_id = %(c)s AND c.id = p.campaign_id
+                     AND p.revoked = false
+                     AND p.expires_at > now()
+                     AND p.fencing_token = c.fencing_token
+                     AND p.consumed_count + %(k)s <= p.approved_count
+                   RETURNING p.id, p.mode""", {"c": campaign_id, "k": k}).fetchone()
+            if row:
+                return {**row, "units": k}
+            k //= 2
+        return None
+
+    @staticmethod
+    def pin(conn, permit_id: int):
+        """Inside the call transaction, before anything else: is this permit still live? If so,
+        hold it FOR KEY SHARE until commit, so the next decision waits for this call (see decide).
+
+        # CONCURRENCY: KEY SHARE does not conflict with other pins or with claim_units (a
+        # non-key UPDATE), so pins do not contend. It conflicts only with the decider's FOR UPDATE.
         """
         return conn.execute(
-            """UPDATE dial_permits p SET consumed_count = p.consumed_count + 1
-               FROM campaigns c
-               WHERE p.campaign_id = %s AND c.id = p.campaign_id
-                 AND p.revoked = false
-                 AND p.consumed_count < p.approved_count
-                 AND p.expires_at > now()
+            """SELECT p.id, p.mode FROM dial_permits p JOIN campaigns c ON c.id = p.campaign_id
+               WHERE p.id = %s AND p.revoked = false AND p.expires_at > now()
                  AND p.fencing_token = c.fencing_token
-               RETURNING p.id, p.mode""", (campaign_id,)).fetchone()
+               FOR KEY SHARE OF p""", (permit_id,)).fetchone()

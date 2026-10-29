@@ -1,15 +1,21 @@
 """Call Allocator: turns permit units into calls. It cannot dial without a permit.
 
-Per call slot, one transaction (LOCK ORDER: permit -> borrower -> agent; the call row is new):
+Permit units are claimed in small batches (SafetyController.claim_units), one short statement
+that holds the permit row lock only for itself. The worker keeps the claimed units and spends
+them one call at a time. Per call, one transaction (LOCK ORDER: permit -> borrower -> agent;
+the call row is new):
 
-    1. consume one permit unit            (SafetyController.consume_one)
+    1. pin the permit: still live?        (SafetyController.pin, FOR KEY SHARE, no contention)
     2. lease the next due borrower        (FOR UPDATE SKIP LOCKED)
     3. progressive only: reserve an agent (atomic AVAILABLE -> RESERVED)
     4. insert the call row with a fresh UUID (the provider idempotency key)
 
-All four or nothing: if any step finds nothing, the transaction rolls back and the permit unit
-is returned. The agent becomes RESERVED at the same instant a call row exists for it, and both
-are durable BEFORE the provider is contacted, so a crash at any later point leaves a row that
+All or nothing: if any step finds nothing, the transaction rolls back. The claimed unit is not
+returned to the permit; it stays with this worker for its next call, and is dropped when the
+permit is revoked or expires. Dropped units mean fewer calls than approved, never more.
+
+The agent becomes RESERVED at the same instant a call row exists for it, and both are durable
+BEFORE the provider is contacted, so a crash at any later point leaves a row that
 reconciliation can resolve by asking the provider about that idempotency key.
 
 The provider call happens after COMMIT, never inside a transaction: holding row locks across a
@@ -26,6 +32,8 @@ from smartdialer.faults import crash_point
 from smartdialer.providers.interface import DialAccepted, DialRejected, Provider
 from smartdialer.safety.controller import SafetyController
 from smartdialer.transitions import advance_call, record_creation, reserve_agent
+
+CLAIM_BATCH = 10   # units claimed per permit-row statement; leftovers are dropped on revoke
 
 
 def lease_borrower(conn, campaign_id: int, worker_id: str, max_attempts: int):
@@ -51,16 +59,30 @@ class CallAllocator:
         self.providers = providers
         self.worker_id = worker_id
         self.pool = ThreadPoolExecutor(max_workers=dial_threads, thread_name_prefix="dial")
+        self.held: dict[int, dict] = {}   # campaign -> claimed units not yet spent {"id", "mode", "units"}
         self.reserve_latencies_ms: list[float] = []   # dispatch transaction time per created call (load test)
 
     def dispatch(self, conn, campaign_id: int, max_calls: int, max_attempts: int) -> list[dict]:
         camp = conn.execute("SELECT provider_name FROM campaigns WHERE id = %s", (campaign_id,)).fetchone()
         created = []
+        retries = 0
         while len(created) < max_calls:
             t0 = time.perf_counter()
-            call = self._create_call(conn, campaign_id, camp["provider_name"], max_attempts)
+            held = self.held.get(campaign_id)
+            if not held or held["units"] == 0:
+                held = self.safety.claim_units(conn, campaign_id, min(CLAIM_BATCH, max_calls - len(created)))
+                if held is None:
+                    break   # no live permit, or it is used up
+                self.held[campaign_id] = held
+            call = self._create_call(conn, campaign_id, camp["provider_name"], max_attempts, held)
+            if call == "STALE":
+                self.held.pop(campaign_id, None)   # permit revoked or expired: drop the units
+                retries += 1
+                if retries > 1:
+                    break
+                continue
             if call is None:
-                break
+                break   # no borrower or no agent right now; the unit was given back
             self.reserve_latencies_ms.append((time.perf_counter() - t0) * 1000)
             created.append(call)
         if created:
@@ -73,29 +95,35 @@ class CallAllocator:
                 self.record_dial_result(conn, call["id"], result, provider)
         return created
 
-    def _create_call(self, conn, campaign_id, provider_name, max_attempts):
+    def _create_call(self, conn, campaign_id, provider_name, max_attempts, held):
+        # Spend the unit before the transaction and give it back only on our own Rollback, when
+        # nothing was committed. If COMMIT itself fails (say the connection drops), the call may
+        # exist: the unit stays spent, so a unit can never turn into two calls.
+        held["units"] -= 1
         call = None
         with conn.transaction():
             # LOCK ORDER: permit -> borrower -> agent
-            permit = self.safety.consume_one(conn, campaign_id)
-            if permit is None:
+            if self.safety.pin(conn, held["id"]) is None:
+                call = "STALE"
                 raise psycopg.Rollback()
             borrower = lease_borrower(conn, campaign_id, self.worker_id, max_attempts)
             if borrower is None:
-                raise psycopg.Rollback()   # gives the permit unit back
+                held["units"] += 1
+                raise psycopg.Rollback()
             call_id = uuid.uuid4()
             agent_id = None
-            if permit["mode"] == "PROGRESSIVE":
+            if held["mode"] == "PROGRESSIVE":
                 agent_id = reserve_agent(conn, campaign_id, call_id, self.worker_id)
                 if agent_id is None:
-                    raise psycopg.Rollback()   # no agent: un-lease the borrower, return the unit
+                    held["units"] += 1
+                    raise psycopg.Rollback()   # no agent: un-lease the borrower
             state = S.RESERVED if agent_id else S.QUEUED
             conn.execute(
                 """INSERT INTO calls (id, campaign_id, borrower_id, agent_id, mode, state, state_rank,
                        provider_name, owner_worker, permit_id)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (call_id, campaign_id, borrower["id"], agent_id, permit["mode"], state.value,
-                 1 if agent_id else 0, provider_name, self.worker_id, permit["id"]))
+                (call_id, campaign_id, borrower["id"], agent_id, held["mode"], state.value,
+                 1 if agent_id else 0, provider_name, self.worker_id, held["id"]))
             record_creation(conn, call_id, state.value, self.worker_id)
             call = {"id": call_id, "phone": borrower["phone"], "agent_id": agent_id}
         return call

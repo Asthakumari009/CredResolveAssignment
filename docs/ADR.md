@@ -13,7 +13,7 @@ Format for each: **Chosen**, **Why**, **Problem it solves**, **What it makes har
 - **Problem it solves:** Any worker can crash at any instruction, and the state on disk is still
   consistent and complete. The invariants are checkable from the history tables alone.
 - **What it makes harder:** Throughput is bounded by hot rows. The permit row is updated by every
-  dispatch in a campaign, and the `provider_health` row by every evaluation. `SCALING.md` measures
+  batch claim in a campaign, and the `provider_health` row by every evaluation. `SCALING.md` measures
   this and describes the fixes. Every read is a query, so the snapshot query has to stay cheap.
 
 ## ADR-2: Webhooks go into an inbox table, and workers apply them
@@ -52,15 +52,38 @@ Format for each: **Chosen**, **Why**, **Problem it solves**, **What it makes har
 - **Chosen:** Pacing returns a number and an explanation and nothing else. The Safety Controller
   revokes the previous permit, takes its own snapshot, applies the rules, logs the decision to
   `safety_decisions`, and inserts one `dial_permits` row (approved count, 2 s expiry, token).
-  The allocator can only create a call by consuming one unit of that row, in the same transaction
-  that leases the borrower, reserves the agent and inserts the call.
+  Workers **claim** units in batches of up to 10 with one short statement
+  (`consumed_count = consumed_count + k ... AND consumed_count + k <= approved_count`, falling back to
+  smaller k), outside any other transaction. Each call transaction **pins** the permit
+  (`FOR KEY SHARE`, valid only if unrevoked, unexpired and current-token), then leases the borrower,
+  reserves the agent and inserts the call. A call needs both a claimed unit and a live pin.
 - **Why:** The safety boundary is structural, not a convention. There is no code path from pacing to a
   dial. `CallAllocator` refuses to be constructed without a `SafetyController`, and
   `tests/test_architecture.py` checks the imports.
 - **Problem it solves:** A pacing bug (or a stale snapshot) cannot exceed what the rules allow.
   "Why did we dial 17 and not 10?" is answered by one row: proposal, snapshot, reason codes, outcome.
-- **What it makes harder:** One more round trip per tick, and a hot permit row per campaign (every
-  dispatch updates it). The 2 s expiry means a slow leader starves dispatch rather than overdials.
+- **Why unused claimed units are dropped, not returned:** A worker may claim 10 units and only use 3
+  (no free agent, no due borrower, or the permit was revoked first). Those 7 are never given back:
+  they just die with the permit. This is safe because each unit can turn into at most one call, and
+  only through a transaction that pinned a live permit. So for every permit,
+  `calls <= claimed <= approved`. The second inequality is enforced by the claim's WHERE clause and a CHECK
+  constraint. The first holds because a unit is spent at most once by its own worker: it is deducted before the
+  call transaction and given back only on an explicit rollback, so even a COMMIT whose acknowledgement
+  is lost cannot let one unit become two calls. A dropped unit
+  can only make the number of calls *smaller* than approved, never larger. The cost is
+  underdialing: measured at 0.2% to 4% of claimed units (`SCALING.md`). Returning units would need another
+  write to the hot row and a way to return units from a crashed worker. Neither buys any safety.
+- **Why the revoke is two steps:** Batching means call transactions no longer hold the permit row
+  lock, so revoking no longer waits for them by itself. `decide` therefore (1) retires the live permit
+  in its own short transaction, after which no new pin can succeed, then (2) takes `FOR UPDATE` on
+  the retired row, which waits for exactly the pins taken before step 1. Only then does it read its
+  snapshot. So every call the old permit will ever produce is counted. Pins taken after step 1 fail,
+  so the waiter set is finite and the decider cannot be starved
+  (`tests/test_permits.py::test_decider_waits_for_pinned_calls_and_counts_them`).
+- **What it makes harder:** One more round trip per tick, and one permit row per campaign that every
+  claim updates (short, once per batch: about 2 waiters at 32 workers, `SCALING.md`). The invariant is
+  `calls <= claimed` rather than `calls == consumed`, so "how many calls did this permit make" is a count
+  of calls, not a column. The 2 s expiry means a slow leader starves dispatch rather than overdials.
   That is the right failure direction.
 
 ## ADR-5: Python 3.12

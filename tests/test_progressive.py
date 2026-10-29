@@ -42,7 +42,8 @@ def test_50_agents_never_more_than_50_agent_bound_calls(dsn, conn):
            FROM calls WHERE campaign_id = %s AND state NOT IN ('COMPLETED','FAILED','CANCELLED','ABANDONED')""",
         (cid,)).fetchone()
     assert r == {"calls": 50, "agents": 50, "unbound": 0}
-    assert conn.execute("SELECT consumed_count FROM dial_permits WHERE id = %s", (pid,)).fetchone()["consumed_count"] == 50
+    claimed = conn.execute("SELECT consumed_count FROM dial_permits WHERE id = %s", (pid,)).fetchone()["consumed_count"]
+    assert 50 <= claimed <= 200, "units are claimed in batches; unspent ones are dropped, never turned into calls"
     assert conn.execute("SELECT count(*) AS n FROM borrowers WHERE state = 'IN_PROGRESS'").fetchone()["n"] == 50
     assert conn.execute("SELECT count(*) AS n FROM agents WHERE state = 'DIALING'").fetchone()["n"] == 50
 
@@ -94,11 +95,12 @@ def test_uncertain_dial_records_nothing(conn):
     assert conn.execute("SELECT state FROM agents").fetchone()["state"] == "RESERVED"
 
 
-def test_no_agent_means_no_call_and_unit_returned(conn):
+def test_no_agent_means_no_call(conn):
     cid = make_campaign(conn, agents=0, borrowers=3)
     pid = issue_permit(conn, cid, approved=3)
     assert _allocator().dispatch(conn, cid, 5, 3) == []
-    assert conn.execute("SELECT consumed_count FROM dial_permits WHERE id = %s", (pid,)).fetchone()["consumed_count"] == 0
+    assert conn.execute("SELECT count(*) AS n FROM calls").fetchone()["n"] == 0
+    assert conn.execute("SELECT consumed_count FROM dial_permits WHERE id = %s", (pid,)).fetchone()["consumed_count"] <= 3
     assert conn.execute("SELECT count(*) AS n FROM borrowers WHERE state = 'PENDING'").fetchone()["n"] == 3
 
 
@@ -124,3 +126,17 @@ def test_predictive_answer_claims_agent_or_waits(conn):
         _, row2 = advance_call(conn, c2["id"], "ANSWERED", worker_id="w")
     assert row1["state"] == "CONNECTED" and row1["agent_id"] is not None
     assert row2["state"] == "ANSWERED" and row2["agent_id"] is None, "no agent left: waits for answer-hold"
+
+
+def test_held_units_are_spent_on_later_passes_but_not_after_revoke(conn):
+    """Units claimed in one pass stay with the worker for the next pass while the permit is live,
+    and are dropped as soon as it is revoked."""
+    cid = make_campaign(conn, agents=1, borrowers=5)
+    pid = issue_permit(conn, cid, approved=5)
+    alloc = _allocator(FakeProvider(lambda k: DialRejected("503")))   # rejected: agent freed at once
+    assert len(alloc.dispatch(conn, cid, 5, 3)) == 1, "claims 5, one agent: one call, 4 units held"
+    assert len(alloc.dispatch(conn, cid, 5, 3)) == 1
+    assert conn.execute("SELECT consumed_count FROM dial_permits WHERE id = %s", (pid,)).fetchone()["consumed_count"] == 5,         "second call spent a held unit, no new claim"
+    issue_permit(conn, cid, approved=0)   # next decision: revoke, approve nothing
+    assert alloc.dispatch(conn, cid, 5, 3) == []
+    assert conn.execute("SELECT count(*) AS n FROM calls WHERE permit_id = %s", (pid,)).fetchone()["n"] == 2

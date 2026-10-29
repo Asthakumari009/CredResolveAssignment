@@ -43,7 +43,7 @@ def _race_loop(op, dsn, campaign_id, rounds, start, done, results):
                     elif op == "borrower":
                         won = lease_borrower(conn, campaign_id, f"w{os.getpid()}", 99) is not None
                     else:
-                        won = SafetyController.consume_one(conn, campaign_id) is not None
+                        won = SafetyController.claim_units(conn, campaign_id, 1) is not None
                 results.put((r, won, None))
             except Exception as e:   # any DB error is a test failure, reported to the parent
                 results.put((r, False, repr(e)))
@@ -90,3 +90,55 @@ def test_50_workers_race_for_permit_units(dsn, conn):
     reset = lambda: conn.execute("UPDATE dial_permits SET consumed_count = 0 WHERE id = %s", (pid,))
     _race(dsn, conn, cid, "permit", reset, winners_per_round=10)
     assert conn.execute("SELECT consumed_count FROM dial_permits WHERE id = %s", (pid,)).fetchone()["consumed_count"] == 10
+
+
+BATCH_ROUNDS = int(os.environ.get("BATCH_ROUNDS", "20"))
+
+
+def _claimer(dsn, campaign_id, seed, start, results):
+    import random
+    rng = random.Random(seed)
+    try:
+        with connect(dsn) as conn:
+            for r in range(BATCH_ROUNDS):
+                start.wait()
+                got, err = 0, None
+                try:
+                    # Keep claiming random batch sizes until the permit is used up.
+                    while (c := SafetyController.claim_units(conn, campaign_id, rng.randint(1, 25))) is not None:
+                        got += c["units"]
+                except Exception as e:   # noqa: BLE001
+                    err = repr(e)
+                results.put((r, got, err))
+                start.wait()   # wait for the parent to check and reset
+    finally:
+        results.close()
+        results.join_thread()
+        os._exit(0)
+
+
+def test_50_workers_batch_claims_never_exceed_approved(dsn, conn):
+    """50 processes claim random batch sizes (1 to 25) from one permit until it is used up.
+    Total units handed out must equal approved_count exactly: never more (the safety property),
+    and not fewer either (the fallback to smaller batches drains the remainder)."""
+    cid = make_campaign(conn)
+    pid = issue_permit(conn, cid, approved=997)   # not a multiple of anything convenient
+    start, results = CTX.Barrier(RACERS + 1), CTX.Queue()
+    procs = [CTX.Process(target=_claimer, args=(dsn, cid, i, start, results)) for i in range(RACERS)]
+    for p in procs:
+        p.start()
+    try:
+        for r in range(BATCH_ROUNDS):
+            start.wait(timeout=30)
+            outcomes = [results.get(timeout=60) for _ in range(RACERS)]
+            assert not [e for _, _, e in outcomes if e]
+            total = sum(g for _, g, _ in outcomes)
+            row = conn.execute("SELECT consumed_count, approved_count FROM dial_permits WHERE id = %s", (pid,)).fetchone()
+            assert total == row["consumed_count"] == row["approved_count"] == 997, f"round {r}: {total}, {row}"
+            conn.execute("UPDATE dial_permits SET consumed_count = 0 WHERE id = %s", (pid,))
+            start.wait(timeout=30)
+    finally:
+        for p in procs:
+            p.join(timeout=10)
+            if p.is_alive():
+                p.kill()

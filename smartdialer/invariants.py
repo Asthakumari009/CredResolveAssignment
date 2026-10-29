@@ -25,9 +25,11 @@ def check_all(conn, settle_checks: bool = True) -> list[tuple[str, int]]:
             SELECT count(*) AS n FROM (SELECT call_id, to_state FROM call_transitions
                                        GROUP BY 1, 2 HAVING count(*) > 1) d""")),
         ("permits never over-consumed", _count(conn, "SELECT count(*) AS n FROM dial_permits WHERE consumed_count > approved_count")),
-        ("calls per permit == consumed units", _count(conn, """
+        # Claimed units that never became calls are dropped (ADR-4), so this is <=, not ==.
+        # Together with the check above: calls <= claimed <= approved for every permit.
+        ("calls per permit <= claimed units", _count(conn, """
             SELECT count(*) AS n FROM dial_permits p
-            WHERE p.consumed_count <> (SELECT count(*) FROM calls c WHERE c.permit_id = p.id)""")),
+            WHERE (SELECT count(*) FROM calls c WHERE c.permit_id = p.id) > p.consumed_count""")),
         ("every call was created against a permit", _count(conn, "SELECT count(*) AS n FROM calls WHERE permit_id IS NULL")),
     ]
     if settle_checks:

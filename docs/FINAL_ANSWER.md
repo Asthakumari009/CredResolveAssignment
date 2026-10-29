@@ -13,7 +13,7 @@ cannot dial.
 **A Safety Controller decides, deterministically.** It takes its own fresh snapshot and applies
 fixed rules: abandon budget with hysteresis, hard ratio cap, agent-drop and answer-rate-drift
 detectors, provider health, calling window, cold start. It writes the decision and its reason
-codes to a table. The only way to place a call is to consume one unit of the short-lived permit
+codes to a table. The only way to place a call is to spend one unit of the short-lived permit
 it issues, in the same database transaction that leases the borrower and creates the call. When
 anything is uncertain (too few samples, drift, a sick provider, a deposed leader), the rules fall back to
 progressive, which cannot abandon. So the worst case is progressive's worst case.

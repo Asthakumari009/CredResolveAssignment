@@ -19,7 +19,7 @@ RETURNING id
   takes agent 8 instead. No contention, no waiting.
 - If `SKIP LOCKED` were removed, worker 2 would wait on agent 7's row lock. When worker 1 commits, Postgres
   re-evaluates `state = 'AVAILABLE'` on the new row version, which is now RESERVED. Worker 2 gets 0 rows and
-  its whole dispatch transaction rolls back, returning the permit unit and the borrower.
+  its whole call transaction rolls back, un-leasing the borrower. The worker keeps its claimed permit unit for its next call.
 - Backstop: the partial unique index `one_live_call_per_agent` on `calls(agent_id)` for live
   states. Even a bug in the code above could not commit two live calls for one agent.
 - Proof: `tests/test_races.py` runs 50 processes x 500 rounds against the real database, and the invariant
@@ -73,13 +73,16 @@ The scenarios are E (20% to 70%) and F (70% to 10%) in `sim/scenarios.py`. `make
 
 From `docs/SCALING.md`, measured:
 
-- First: **the permit row**. `SafetyController.consume_one` is the first statement in the dispatch
-  transaction, so the campaign's permit row is locked through the whole transaction. Dispatch per campaign is serial,
+- First: **the permit row**, measured and fixed. The old `consume_one` was the first statement in the dispatch
+  transaction, so the campaign's permit row was locked through the whole transaction. Dispatch per campaign was serial,
   with a ceiling of about 110 to 120 reservations/s. Going from 16 to 32 workers *dropped* throughput from 123/s to 78/s, and
   every sampled lock wait was on that row.
 - Real traffic is about 0.011 to 0.03 dials/s per agent, so 1,000 agents in one campaign is fine (about 30/s),
   10,000 in one campaign is not (about 300/s), and 100,000 needs partitioning everywhere.
-- Fixes, in order: consume the permit last, batch reservations, shard the permit, partition by campaign or
+- Fixed with batch claims (`SafetyController.claim_units` plus a `FOR KEY SHARE` pin per call). p50 reservation
+  latency went from 18 to 4.6 ms, and throughput rose 28% to 77%. The new bottleneck is the pacing leader's tick cadence (it shares
+  a loop with dispatch and dials, so it ticks every 340 to 570 ms instead of 250) and then the claim row itself.
+- Next fixes: a dedicated pacing loop, shard the permit, partition by campaign or
   agent pool, PgBouncer, a partitioned inbox, sharded provider health.
 - Adding servers alone makes it worse: more waiters on one lock, slower lock holders, and workers stuck
   on the lock are not processing events.
@@ -134,7 +137,7 @@ the predictive formula's N, reduced by whichever rule appears in `reason_codes`.
 
 ## 8. What would you do with one more week?
 
-1. Consume the permit last in dispatch and batch reservations, then rerun the load test (SCALING fixes 1 and 2).
+1. Give the pacing leader its own loop and shard the permit, then rerun the load test (SCALING fixes 2 and 3).
 2. Early drift signal from answers only, and attribute abandons per provider so Provider B's event
    loss does not count against pacing.
 3. A property-based test that generates random event orders, duplicates and drops per call and checks
@@ -156,8 +159,9 @@ Backstop: `one_live_call_per_borrower`, a partial unique index on live calls. Re
 `transitions._settle_borrower` after the call is terminal, and an answered call is never retried.
 
 **Q: A worker is paused for 30 s (not dead), then wakes up mid-dispatch. What happens?** Every write it
-makes is fenced. Its permit unit was consumed inside its own transaction. If its pacing lease expired, the
-new leader bumped `fencing_token`, and its old permit no longer matches in `consume_one`. Its agent
+makes is fenced. Its claimed permit units can only be spent through `SafetyController.pin`, which
+checks the permit is unrevoked, unexpired and carries the current `fencing_token`. If its lease expired,
+the new leader bumped the token, and its units are dead. Its agent
 transitions carry `reserved_call_id` (`transitions.set_agent_state`). If the agent was released and
 re-reserved, those change 0 rows. Residual risk: if it dials after the reaper already got NOT_FOUND and
 cancelled the call, `record_dial_result` sees CANCELLED and hangs up immediately. The borrower may hear
@@ -166,8 +170,8 @@ one ring that is cut off.
 **Q: How do you know the invariants actually hold, rather than the tests passing by luck?**
 `smartdialer/invariants.check_all` replays the history tables (`call_transitions`, `agent_transitions`,
 `calls`, `dial_permits`). It checks overlap of borrower calls by time, agent binding chains, legal
-chained call transitions, no duplicates, permits never over-consumed, and calls per permit equal to
-consumed units. It runs after every demo, after the 50-process race tests, and after each load run with
+chained call transitions, no duplicates, permits never over-claimed, and calls per permit never more
+than claimed units. It runs after every demo, after the 50-process race tests, and after each load run with
 6,583 / 7,565 / 5,057 calls. Several of them are also database constraints, so a violation could not commit.
 
 **Q: Why is the abandon budget 3% with hysteresis at 1.5% and 60 s?** 3% is the common regulatory
