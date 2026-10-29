@@ -30,10 +30,17 @@ def propose(snap: Snapshot, cfg: CampaignSettings) -> PacingProposal:
     capacity = snap.available + soon - snap.answered_waiting
     in_flight = snap.unbound_in_flight
 
+    # P(overflow) only grows with n, so binary-search the largest n that stays under target.
     n = 0
     if capacity > 0:
-        while n < MAX_PROPOSAL and binom_tail_above(capacity, in_flight + n + 1, p_hi) <= cfg.target_overflow:
-            n += 1
+        lo, hi = 0, MAX_PROPOSAL
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if binom_tail_above(capacity, in_flight + mid, p_hi) <= cfg.target_overflow:
+                lo = mid
+            else:
+                hi = mid - 1
+        n = lo
     p_at = binom_tail_above(capacity, in_flight + n, p_hi)
     p_next = binom_tail_above(capacity, in_flight + n + 1, p_hi)
 
