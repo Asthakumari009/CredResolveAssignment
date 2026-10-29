@@ -1,4 +1,10 @@
 """Permits (C4): consume only from a live, unrevoked, unexpired, current-token permit."""
+import threading
+import time
+from datetime import datetime, timezone
+
+from smartdialer.db import connect
+from smartdialer.domain.types import PacingProposal
 from smartdialer.safety.controller import SafetyController
 from smartdialer.safety.leader import try_lead
 from tests.helpers import issue_permit, make_campaign
@@ -53,3 +59,31 @@ def test_rollback_returns_permit_unit(conn):
         assert consume(conn, cid)
         raise psycopg.Rollback()
     assert conn.execute("SELECT consumed_count FROM dial_permits WHERE id = %s", (pid,)).fetchone()["consumed_count"] == 0
+
+
+def test_decider_and_consumer_do_not_deadlock(conn, dsn):
+    """Found by the load test. A consumer holds the permit row (consume_one) and then inserts a
+    row with a foreign key to the campaign. Meanwhile the decider holds the campaign row and waits
+    on that permit to revoke it. The decider must not block the consumer's FK check."""
+    cid = make_campaign(conn)
+    token = try_lead(conn, cid, "leader", lease_ms=60_000)
+    issue_permit(conn, cid, approved=5, token=token)
+    proposal = PacingProposal(1, "PROGRESSIVE", "test", datetime.now(timezone.utc))
+    errors = []
+
+    def decide():
+        try:
+            with connect(dsn) as c2:
+                SafetyController("leader").decide(c2, cid, token, proposal)
+        except Exception as e:   # noqa: BLE001
+            errors.append(e)
+
+    with conn.transaction():
+        assert consume(conn, cid)                     # permit row now locked by this transaction
+        t = threading.Thread(target=decide)
+        t.start()
+        time.sleep(0.5)                               # decider holds the campaign row, waits on the permit
+        conn.execute("SET LOCAL lock_timeout = '3s'")
+        conn.execute("INSERT INTO borrowers (campaign_id, phone) VALUES (%s, '+910')", (cid,))   # FK check
+    t.join(timeout=10)
+    assert not errors, errors

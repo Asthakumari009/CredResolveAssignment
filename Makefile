@@ -24,7 +24,7 @@ sim:
 	$(RUN) python -m sim.run_all
 
 loadtest:
-	$(RUN) python -m loadtest.run
+	$(RUN) python -m loadtest.run $(ARGS)
 
 demo-%:
 	$(RUN) python -m demos.$(subst -,_,$*)

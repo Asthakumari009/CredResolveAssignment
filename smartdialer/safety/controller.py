@@ -20,7 +20,12 @@ class SafetyController:
         cfg = load_settings(conn, campaign_id)
         with conn.transaction():
             # LOCK ORDER: campaign -> permit. Holding the campaign row serializes deciders.
-            camp = conn.execute("SELECT safety_state FROM campaigns WHERE id = %s FOR UPDATE", (campaign_id,)).fetchone()
+            # CONCURRENCY: FOR NO KEY UPDATE, not FOR UPDATE. Consumers hold the permit row and then
+            # insert a call, whose foreign key check takes KEY SHARE on this campaign row. FOR UPDATE
+            # blocks KEY SHARE, so decider (campaign, waiting on permit) and consumer (permit, waiting
+            # on campaign) deadlocked under load. NO KEY UPDATE still excludes other deciders.
+            camp = conn.execute("SELECT safety_state FROM campaigns WHERE id = %s FOR NO KEY UPDATE",
+                                (campaign_id,)).fetchone()
             snap = load_snapshot(conn, campaign_id, cfg, self.worker_id, fencing_token)
             if snap.leader_ok:
                 # Revoke first, then re-read: the revoke waits for any in-flight consume of the old

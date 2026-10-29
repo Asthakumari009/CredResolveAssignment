@@ -48,20 +48,20 @@ def _wait_healthy(url: str, proc: subprocess.Popen):
 
 
 @contextmanager
-def services():
+def services(webhook_workers: int = 1, agent_wrap_up_s: float = 0.5):
     """Mock provider (8001) and webhook receiver (8002) as separate processes."""
     env = {**os.environ, "WEBHOOK_URL": WEBHOOK_URL + "/events"}
     procs = [
         subprocess.Popen([sys.executable, "-m", "uvicorn", "mock_provider.app:app", "--port", "8001", "--log-level", "warning"], env=env),
         subprocess.Popen([sys.executable, "-m", "uvicorn", "smartdialer.events.webhook_api:app", "--port", "8002",
-                          "--log-level", "warning", "--workers", "1"], env=env),
+                          "--log-level", "warning", "--workers", str(webhook_workers)], env=env),
     ]
     try:
         _wait_healthy(MOCK_URL, procs[0])
         _wait_healthy(WEBHOOK_URL, procs[1])
         httpx.post(MOCK_URL + "/control/reset")
         from demos.agent_desk import AgentDesk
-        desk = AgentDesk()
+        desk = AgentDesk(agent_wrap_up_s)
         desk.start()
         try:
             yield
@@ -77,12 +77,15 @@ def services():
                 p.kill()   # requests stuck in a simulated outage keep uvicorn from exiting cleanly
 
 
-def start_worker(worker_id: str, crash_at: str | None = None, seconds: float = 120) -> subprocess.Popen:
+def start_worker(worker_id: str, crash_at: str | None = None, seconds: float = 120, extra: list[str] | None = None,
+                 quiet: bool = False) -> subprocess.Popen:
     env = {**os.environ, "PROVIDER_URL": MOCK_URL}
     if crash_at:
         env["SMARTDIALER_CRASH_AT"] = crash_at
-    say(f"starting worker {worker_id}" + (f" (will SIGKILL itself at '{crash_at}')" if crash_at else ""))
-    return subprocess.Popen([sys.executable, "-m", "smartdialer.worker.main", "--id", worker_id, "--seconds", str(seconds)], env=env)
+    if not quiet:
+        say(f"starting worker {worker_id}" + (f" (will SIGKILL itself at '{crash_at}')" if crash_at else ""))
+    return subprocess.Popen([sys.executable, "-m", "smartdialer.worker.main", "--id", worker_id, "--seconds", str(seconds),
+                             *(extra or [])], env=env, stdout=subprocess.DEVNULL if quiet else None)
 
 
 def wait_for(predicate, timeout_s: float, what: str):

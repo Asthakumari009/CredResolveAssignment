@@ -1,6 +1,6 @@
 # SmartDialer: Phase 0 Plan
 
-Status: **approved with conditions (below)**. Phase 1 has not started; waiting on answers to section 12.
+Status: **approved with conditions (below); built.** Section 14 lists where the implementation departs from this plan and why. Q6 (Plivo) was taken as recommended: skipped, see ADR.
 
 Sources: `ASSIGNMENT.md` (the CredResolve assignment) and the build brief. Where this plan departs from the brief, the change is listed in section 11 with a reason, and the decisions I need from you are in section 12.
 
@@ -398,3 +398,24 @@ Order follows C7: correctness first, simulation and load test last.
 6. Simulator, scenarios A to D (progressive vs predictive, Provider A vs B), charts, `SIMULATION_RESULTS.md`, answer-rate-shock demo.
 7. Load test at 8, 16, 32 workers, `SCALING.md` with the measured numbers.
 8. README, ARCHITECTURE, ADR, STATE_MACHINES, FINAL_ANSWER, INTERVIEW_PREP; final clean run of everything.
+
+---
+
+## 14. Implementation deviations (what changed while building, and why)
+
+Each of these came from a failing demo, test or load run, not from preference.
+
+| # | Plan said | Built | Why |
+| --- | --- | --- | --- |
+| D1 | Reaper claims items with per-row leases (SKIP LOCKED) | Age-based reconciliation: a call is polled when it has been in a state too long (`reconcile_pre_dial_s`, `reconcile_in_flight_s`). No per-row leases. Worker heartbeat is for visibility only | Any worker may reconcile any call; the provider answer is idempotent and the result goes through the inbox like a real event, so two reapers polling the same call is harmless. Fewer moving parts than leases. See ADR-7 |
+| D2 | AGENT_DROP compares available agents to a recent max | Compares **staffed** agents (logged in, not paused) | Available agents swing with normal call load, so the rule fired constantly in the agent-drop demo |
+| D3 | ANSWER_RATE_DRIFT: fixed threshold on the difference | Difference > 0.15 **and** two-proportion z >= 3.5, 15 s cooldown | The fixed threshold fired on sampling noise with small windows |
+| D4 | Events applied in arrival order | Per-call FIFO by (sequence, id) with a 1500 ms resequencing hold for gaps | Concurrent workers reordered ANSWERED and COMPLETED for the same call, producing false abandons |
+| D5 | Answer-rate window by resolution time | Sampled by **dial time** over the resolved prefix (calls dialed before the oldest unresolved call) | Resolution-time sampling is biased toward fast answers (no-answers resolve last), which inflated p |
+| D6 | Breaker window by time | Count-based: last 20 decided attempts since the last state change | A time window was diluted by earlier successes, so the breaker never opened in the outage demo |
+| D7 | Reaper polls sequentially | Polls in parallel on a thread pool, skipped while the breaker is OPEN | Sequential 3 s timeouts blocked workers during an outage |
+| D8 | NOT_FOUND is the only synthetic event | Also TIMEOUT -> FAILED(TIMEOUT) after `reconcile_give_up_s` of an unreachable provider | Otherwise a call (and its agent) is held forever during a long outage |
+| D9 | Agent presence timeout | Dropped. Agent loss is an explicit action (OFFLINE / PAUSED) | No agent client in this prototype to heartbeat; a timer would only be exercised by itself |
+| D10 | Safety Controller locks the campaign row FOR UPDATE | FOR NO KEY UPDATE | Found by the load test: consumers hold the permit row and then insert a call whose foreign key takes KEY SHARE on the campaign row. FOR UPDATE blocks KEY SHARE, and decider and consumer deadlocked. Regression test: `test_decider_and_consumer_do_not_deadlock` |
+| D11 | Mock provider sends webhooks with httpx.AsyncClient | Sync httpx.Client on a 32-thread pool | Measured: the async client delivered ~70 events/s in this setup, the thread pool ~600/s. At 1,000 agents the mock, not the dialer, was the bottleneck |
+| D12 | `loadtest/report.py` | Folded into `loadtest/run.py` | One file was enough |

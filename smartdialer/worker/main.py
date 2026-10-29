@@ -13,8 +13,10 @@ The loop only sequences calls into the modules; the decisions live in pure funct
 drift away from what the simulator measures.
 """
 import argparse
+import json
 import logging
 import os
+import signal
 import time
 import traceback
 import uuid
@@ -84,19 +86,25 @@ def main() -> None:
     ap.add_argument("--id", default=f"worker-{os.getpid()}-{uuid.uuid4().hex[:4]}")
     ap.add_argument("--seconds", type=float, default=float("inf"))
     ap.add_argument("--provider-url", default=os.environ.get("PROVIDER_URL", "http://127.0.0.1:8001"))
+    ap.add_argument("--metrics-file", help="on exit, write dispatch latencies here (load test)")
     args = ap.parse_args()
+    stopping = []
+    signal.signal(signal.SIGTERM, lambda *_: stopping.append(1))   # finish the pass, then exit cleanly
     logging.basicConfig(level=logging.INFO, format=f"%(asctime)s [{args.id}] %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     w = Worker(args.id, args.provider_url)
     log.info("started (pid %s)", os.getpid())
     end = time.monotonic() + args.seconds
-    while time.monotonic() < end:
+    while time.monotonic() < end and not stopping:
         try:
             if w.step() == 0:
                 time.sleep(0.05)
         except Exception:
             log.error("pass failed, continuing:\n%s", traceback.format_exc())
             time.sleep(0.5)
+    if args.metrics_file:
+        with open(args.metrics_file, "w") as f:
+            json.dump({"worker": args.id, "reserve_ms": w.allocator.reserve_latencies_ms}, f)
 
 
 if __name__ == "__main__":

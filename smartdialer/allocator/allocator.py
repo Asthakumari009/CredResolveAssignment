@@ -15,6 +15,7 @@ reconciliation can resolve by asking the provider about that idempotency key.
 The provider call happens after COMMIT, never inside a transaction: holding row locks across a
 2 s Provider B round trip would serialize the whole campaign.
 """
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
@@ -50,14 +51,17 @@ class CallAllocator:
         self.providers = providers
         self.worker_id = worker_id
         self.pool = ThreadPoolExecutor(max_workers=dial_threads, thread_name_prefix="dial")
+        self.reserve_latencies_ms: list[float] = []   # dispatch transaction time per created call (load test)
 
     def dispatch(self, conn, campaign_id: int, max_calls: int, max_attempts: int) -> list[dict]:
         camp = conn.execute("SELECT provider_name FROM campaigns WHERE id = %s", (campaign_id,)).fetchone()
         created = []
         while len(created) < max_calls:
+            t0 = time.perf_counter()
             call = self._create_call(conn, campaign_id, camp["provider_name"], max_attempts)
             if call is None:
                 break
+            self.reserve_latencies_ms.append((time.perf_counter() - t0) * 1000)
             created.append(call)
         if created:
             crash_point("after_commit_before_dial")
