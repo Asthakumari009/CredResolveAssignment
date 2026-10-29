@@ -55,9 +55,11 @@ def main():
         drop_start = conn.execute("SELECT clock_timestamp() AS t").fetchone()["t"]
         say("dropping 40 agents over 3 seconds")
         victims = [r["id"] for r in conn.execute("SELECT id FROM agents ORDER BY id LIMIT 40")]
-        threshold_at = None
+        threshold_at = first_left_at = None
         for i, aid in enumerate(victims, 1):
             agent_action(conn, aid, "OFFLINE", "agent disappeared")
+            if i == 1:
+                first_left_at = conn.execute("SELECT clock_timestamp() AS t").fetchone()["t"]
             if i == 21:   # staffed falls below 80% of 100 here
                 threshold_at = conn.execute("SELECT clock_timestamp() AS t").fetchone()["t"]
             time.sleep(3 / 40)
@@ -71,9 +73,16 @@ def main():
         first_cap = conn.execute(
             """SELECT min(at) AS t FROM safety_decisions WHERE at >= %s AND mode = 'PREDICTIVE'
                AND 'HARD_RATIO_CAP' = ANY(reason_codes)""", (drop_start,)).fetchone()["t"]
+        first_protective = conn.execute(
+            """SELECT at, outcome, reason_codes FROM safety_decisions WHERE at >= %s AND outcome <> 'APPROVE'
+               ORDER BY at LIMIT 1""", (first_left_at,)).fetchone()
         before = abandons(conn, drop_start - (drop_end - drop_start) * 5, drop_start)
         during = abandons(conn, drop_start, drop_end + (drop_end - drop_start) * 3)
         print("\n  Reaction")
+        if first_protective:
+            print(f"    TOTAL: first agent left -> first {first_protective['outcome']} ({','.join(first_protective['reason_codes'])}):"
+                  f" {(first_protective['at'] - first_left_at).total_seconds() * 1000:.0f} ms")
+            print("    (the drop itself is spread over 3 s; the rule fires once staffed is down 20%, then within one tick)")
         if first_cap:
             print(f"    first HARD_RATIO_CAP reduction after drop start: {(first_cap - drop_start).total_seconds() * 1000:6.0f} ms")
         print(f"    staffed fell below 80% at:                       {(threshold_at - drop_start).total_seconds() * 1000:6.0f} ms after drop start")
