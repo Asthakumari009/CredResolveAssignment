@@ -117,3 +117,17 @@ def test_pacer_cannot_switch_safety_off():
     snapshot is still capped."""
     d, _ = run(pred(10_000), snap(available=2, abandon_n=100, abandon_count=10))
     assert d.approved_calls <= 2 and d.mode == "PROGRESSIVE"
+
+
+def test_recovery_ramp_after_breaker_closes():
+    """Just CLOSED after an outage: start at 20% of the approval and ramp linearly to 100% over 20 s."""
+    full = run(pred(20), snap(available=10, breaker_state="CLOSED", breaker_age_s=None))[0]
+    assert (full.approved_calls, full.reason_codes) == (20, ()), "never tripped: no ramp"
+    start = run(pred(20), snap(available=10, breaker_state="CLOSED", breaker_age_s=0.0))[0]
+    assert (start.outcome, start.approved_calls, start.reason_codes) == ("REDUCE", 4, ("PROVIDER_HEALTH",))
+    half = run(pred(20), snap(available=10, breaker_state="CLOSED", breaker_age_s=10.0))[0]
+    assert half.approved_calls == 12, "20 x (0.2 + 0.8 x 0.5)"
+    done = run(pred(20), snap(available=10, breaker_state="CLOSED", breaker_age_s=20.0))[0]
+    assert done.approved_calls == 20 and "PROVIDER_HEALTH" not in done.reason_codes
+    tiny = run(pred(1), snap(available=10, breaker_state="CLOSED", breaker_age_s=0.0))[0]
+    assert tiny.approved_calls == 1, "never ramps a nonzero approval down to zero"

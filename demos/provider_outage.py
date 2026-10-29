@@ -60,6 +60,7 @@ def main():
         time.sleep(25)
         say("OUTAGE OFF")
         control("B", outage=False)
+        outage_off = conn.execute("SELECT now() AS t").fetchone()["t"]
         recovered = wait_for(lambda: conn.execute(
             "SELECT 1 FROM safety_decisions WHERE at > now() - interval '1 second' AND approved_count > 0"
             " AND outcome <> 'REJECT'").fetchone() and conn.execute(
@@ -76,6 +77,20 @@ def main():
         print(f"\n  decisions rejected for PROVIDER_HEALTH: {opened}")
         print(f"  calls dialed against a REJECT decision: {dialed_while_open} (must be 0)")
         print(f"  breaker recovered to CLOSED and approvals resumed: {bool(recovered)}")
+        # Why the breaker can reopen right around OUTAGE OFF: HALF_OPEN lets a few probe calls through.
+        # A probe placed while the provider is still down hangs, counts as failed 3.5 s later, and the
+        # breaker correctly goes back to OPEN; that flip can land after OUTAGE OFF.
+        for label, cmp in (("during the outage", "<"), ("after recovery", ">=")):
+            r = conn.execute(f"""SELECT count(*) AS n, count(*) FILTER (WHERE c.provider_call_id IS NULL) AS failed
+                                FROM calls c JOIN dial_permits p ON p.id = c.permit_id
+                                JOIN safety_decisions d ON d.id = p.decision_id
+                                WHERE d.snapshot->>'breaker_state' = 'HALF_OPEN' AND c.created_at {cmp} %s""",
+                             (outage_off,)).fetchone()
+            print(f"  HALF_OPEN probe calls placed {label}: {r['n']}, never accepted by the provider: {r['failed']}")
+        ramp = [r["approved_count"] for r in conn.execute(
+            """SELECT approved_count FROM safety_decisions WHERE at > %s AND snapshot->>'breaker_state' = 'CLOSED'
+               ORDER BY id LIMIT 8""", (outage_off,))]
+        print(f"  approvals after the breaker closed again (ramping from 20%): {ramp}")
         finish(conn, opened > 0 and dialed_while_open == 0 and bool(recovered))
 
 

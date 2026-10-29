@@ -11,6 +11,8 @@ SELECT now() AS taken_at,
        c.fencing_token,
        (c.pacing_lease_owner = %(worker)s AND c.pacing_lease_expires_at > now()) AS lease_mine,
        COALESCE((SELECT breaker_state FROM provider_health WHERE provider_name = c.provider_name), 'CLOSED') AS breaker_state,
+       (SELECT EXTRACT(EPOCH FROM now() - opened_at) FROM provider_health WHERE provider_name = c.provider_name)
+           AS breaker_age_s,
        a.*, k.*, w.*, ab.*, avgs.*,
        COALESCE((SELECT max((s.snapshot->>'staffed')::int) FROM safety_decisions s
                  WHERE s.campaign_id = c.id AND s.at > now() - %(drop_window)s * interval '1 second'), 0)
@@ -77,4 +79,5 @@ def load_snapshot(conn, campaign_id: int, cfg: CampaignSettings, worker_id: str,
         avg_setup_s=float(r["avg_setup_s"]) if r["avg_setup_s"] is not None else None,
         avg_talk_s=float(r["avg_talk_s"]) if r["avg_talk_s"] is not None else None,
         max_staffed_recent=r["max_staffed_recent"],
+        breaker_age_s=float(r["breaker_age_s"]) if r["breaker_age_s"] is not None else None,
     )

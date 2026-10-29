@@ -89,6 +89,18 @@ def decide(proposal: PacingProposal, snap: Snapshot, cfg: CampaignSettings, memo
         notes.append(f"breaker HALF_OPEN: at most {cfg.half_open_probes} probe calls")
         approved = cfg.half_open_probes
         outcome = outcome if outcome == "FALLBACK_TO_PROGRESSIVE" else "REDUCE"
+    # PROVIDER_HEALTH (recovery): the breaker has only just CLOSED again, on the strength of a few
+    # probe calls. Ramp volume back up linearly over recovery_ramp_s instead of releasing the whole
+    # backlog at once onto a provider that may still be fragile.
+    age = snap.breaker_age_s
+    if snap.breaker_state == "CLOSED" and age is not None and age < cfg.recovery_ramp_s and approved > 0:
+        frac = cfg.recovery_start_factor + (1 - cfg.recovery_start_factor) * age / cfg.recovery_ramp_s
+        ramped = max(1, math.floor(approved * frac))
+        if ramped < approved:
+            reasons.append("PROVIDER_HEALTH")
+            notes.append(f"breaker closed {age:.0f}s ago: ramping, {approved} x {frac:.2f} -> {ramped}")
+            approved = ramped
+            outcome = outcome if outcome == "FALLBACK_TO_PROGRESSIVE" else "REDUCE"
 
     return SafetyDecision(approved, mode, outcome, tuple(reasons), notes=tuple(notes)), mem
 

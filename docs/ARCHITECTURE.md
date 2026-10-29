@@ -143,7 +143,7 @@ sequenceDiagram
 | Worker crash between commit and dial, or after dial before INITIATED | Reaper polls `get_call_status(call id)`. NOT_FOUND -> CANCELLED(NOT_DIALED), and the attempt is not counted; found -> real status | `make demo-worker-crash` |
 | Crash while applying ANSWERED | The event stays in the inbox until processed; any worker resumes. An answer applied after the hold time, or after the call ended, is ABANDONED and counted, never CONNECTED | `make demo-crash-after-answered` |
 | Agents drop | HARD_RATIO_CAP immediately, AGENT_DROP forces progressive | `make demo-agent-drop` |
-| Provider outage | Breaker opens, decisions REJECT, HALF_OPEN probes, recovery | `make demo-provider-outage` |
+| Provider outage | Breaker opens, decisions REJECT, HALF_OPEN probes, recovery ramps from 20% to 100% over 20 s | `make demo-provider-outage` |
 | Answer-rate shock | Hard cap first, ANSWER_RATE_DRIFT forces progressive | `make demo-answer-rate-shock` |
 | Two workers dial the same borrower / reserve the same agent | SKIP LOCKED + state re-check; partial unique indexes as backstop | `tests/test_races.py` (50 processes) |
 | Deposed pacing leader | Fencing token checked in the permit claim and the per-call pin | `tests/test_permits.py` |

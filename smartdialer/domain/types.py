@@ -34,6 +34,7 @@ class Snapshot:
     avg_setup_s: float | None
     avg_talk_s: float | None
     max_staffed_recent: int     # highest `staffed` seen in recent decisions (agent-drop rule)
+    breaker_age_s: float | None = None   # seconds in the current breaker state; None = never changed
 
     def to_json(self) -> dict:
         d = asdict(self)

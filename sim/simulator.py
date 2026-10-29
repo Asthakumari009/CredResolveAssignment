@@ -88,7 +88,7 @@ class Sim:
         self.hold: deque[Call] = deque()              # answered, waiting for an agent
         self.abandon_win: deque[bool] = deque(maxlen=self.cfg.abandon_window)
         self.memory: dict = {}
-        self.breaker_state, self.breaker_since = "CLOSED", 0.0
+        self.breaker_state, self.breaker_since, self.breaker_changed = "CLOSED", 0.0, False
         self.attempts: deque[tuple[float, bool]] = deque(maxlen=2000)
         self.buckets = [Bucket() for _ in range(int(sc.duration_s // 60) + 1)]
         self.decisions: list[dict] = []
@@ -153,7 +153,8 @@ class Sim:
             connected=sum(c.state == "CONNECTED" for c in live),
             window_n=len(window), window_answered=sum(window), short_n=len(short_w), short_answered=sum(short_w),
             abandon_n=len(self.abandon_win), abandon_count=sum(self.abandon_win),
-            avg_setup_s=None, avg_talk_s=None, max_staffed_recent=len(self.agents))
+            avg_setup_s=None, avg_talk_s=None, max_staffed_recent=len(self.agents),
+            breaker_age_s=self.t - self.breaker_since if self.breaker_changed else None)
 
     def tick(self):
         self.at(1.0, self.tick)
@@ -187,7 +188,7 @@ class Sim:
         new = breaker.next_state(self.breaker_state, self.breaker_since, self.t, sum(recent), len(recent) - sum(recent),
                                  sum(probes), len(probes) - sum(probes))
         if new != self.breaker_state:
-            self.breaker_state, self.breaker_since = new, self.t
+            self.breaker_state, self.breaker_since, self.breaker_changed = new, self.t, True
 
     # ------------------------------------------------------------------ allocator + provider model
     def dispatch(self, n: int, mode: str):
