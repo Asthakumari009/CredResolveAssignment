@@ -85,6 +85,19 @@ Format for each: **Chosen**, **Why**, **Problem it solves**, **What it makes har
   `calls <= claimed` rather than `calls == consumed`, so "how many calls did this permit make" is a count
   of calls, not a column. The 2 s expiry means a slow leader starves dispatch rather than overdials.
   That is the right failure direction.
+- **Honest note: batching was not needed at the assignment's scale.** At 1,000 agents the system needs
+  roughly 30 to 33 dials/s (`SCALING.md`: about 0.011 dials/s per agent progressive, about 0.03 at the
+  predictive cap). The pre-batching design (one permit unit consumed inside each call transaction)
+  measured about 115 reservations/s per campaign, already more than three times that. Batching was a deliberate step toward
+  larger single campaigns (10,000 agents is 110 to 300 dials/s). It bought real headroom: p50
+  reservation latency went from 18 to 4.6 ms, and throughput rose 28 to 77%. It also added real complexity that
+  the simpler design did not need:
+  per-call pins (`FOR KEY SHARE`), the two-step retire-then-wait revoke in `decide`, deduct-before-commit
+  unit accounting in the allocator, and a weaker invariant (`calls <= claimed` instead of `==`). Two bugs
+  surfaced while building it, both caught by tests before commit (an impostor could revoke the leader's
+  permit, and a lost COMMIT acknowledgement could have spent a unit twice). If the target were only
+  1,000 agents per campaign, the one-unit-per-transaction design would be the better choice: simpler, and
+  fast enough.
 
 ## ADR-5: Python 3.12
 

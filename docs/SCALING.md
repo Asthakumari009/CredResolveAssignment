@@ -102,8 +102,9 @@ The new limit is **permit supply from the single pacing leader**:
   processes, Postgres, the mock and the webhook share 8 CPUs. The claim statement also has a queue now: 2.4 waiting
   backends on average, all on `UPDATE dial_permits ... consumed_count + k`. The lock is short, but it is still one row.
 
-So the next fixes are: give the pacing leader its own loop (a thread or process that only paces, so ticks
-are on time), and shard the permit (fix 3 below) to remove the last shared row from the dispatch path.
+Proposed fix, **NOT BUILT** (feature freeze): give the pacing leader its own loop (a thread or process
+that only paces, so ticks are on time), then shard the permit (fix 3 below) to remove the last shared
+row from the dispatch path. This stays the measured next bottleneck.
 
 ## Why "add more servers" makes it worse
 
@@ -137,10 +138,10 @@ Predictive at its 2.5x hard cap makes about 0.03 dials/s. Each call produces 3 t
 1. **Done: batched permit claims** (above, ADR-4). The alternative considered first was to take the permit unit last in
    the call transaction. That shortens the lock but still takes it once per call. Batching takes it once
    per 10 calls and keeps the existing lock order.
-2. **A dedicated pacing loop.** Run the leader's tick on its own thread or process, so it is never
+2. **A dedicated pacing loop. NOT BUILT.** Run the leader's tick on its own thread or process, so it is never
    behind a 3 s provider call or a batch of events. Ticks then arrive every 250 ms and permits track
    agents as they free up. This is the measured bottleneck now.
-3. **Permit shards.** The Safety Controller splits an approval of N into S rows of N/S each, and
+3. **Permit shards. NOT BUILT.** The Safety Controller splits an approval of N into S rows of N/S each, and
    each worker claims from shard `hash(worker) % S`, falling back to others when its shard is empty.
    The total stays exactly N (the sum of approvals), and claim contention drops by S.
 4. **Partition by campaign or agent pool.** Each campaign already has its own permit row, leader and

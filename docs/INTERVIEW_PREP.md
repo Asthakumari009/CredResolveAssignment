@@ -137,7 +137,13 @@ the predictive formula's N, reduced by whichever rule appears in `reason_codes`.
 
 ## 8. What would you do with one more week?
 
-1. Give the pacing leader its own loop and shard the permit, then rerun the load test (SCALING fixes 2 and 3).
+1. **Fix the measured next bottleneck: pacing tick cadence (NOT BUILT).** After batch claims, the leader
+   ticks every 340 to 570 ms instead of 250 ms. It is an ordinary worker, so dials (up to 3 s) and event
+   batches sit in front of its tick, and agents who free up wait for the next permit (`docs/SCALING.md`,
+   "After: what is the bottleneck now"). The fix is a dedicated pacing loop: a thread or process that only runs
+   `try_lead`, pacing and `SafetyController.decide`. Then shard the permit (SCALING fix 3) and rerun the
+   8/16/32 sweep. Not needed at 1,000 agents (about 30 dials/s against about 160/s measured), so it
+   was left out in the feature freeze.
 2. Early drift signal from answers only, and attribute abandons per provider so Provider B's event
    loss does not count against pacing.
 3. A property-based test that generates random event orders, duplicates and drops per call and checks

@@ -56,6 +56,37 @@ transaction carries a `# LOCK ORDER:` comment.
   `FOR UPDATE`: the call insert's foreign key check takes `KEY SHARE` on the campaign row while
   holding the permit, and `FOR UPDATE` blocks that. The load test found the resulting deadlock (PLAN D10).
 
+## Permit lifecycle: claim, pin, retire
+
+How a permit is issued, spent in batches, and retired without losing count of calls (ADR-4).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant L as Pacing leader<br/>(SafetyController.decide)
+    participant DB as PostgreSQL<br/>(dial_permits, calls)
+    participant W as Worker<br/>(CallAllocator)
+
+    L->>DB: INSERT permit P1 (approved N, expires now+2s, fencing token)
+    W->>DB: claim_units: UPDATE P1 SET consumed_count = consumed_count + k<br/>WHERE live AND consumed_count + k <= approved (one statement)
+    DB-->>W: k units (worker holds them in memory)
+    loop each call, while units remain
+        W->>DB: BEGIN; pin P1 FOR KEY SHARE (still live?)
+        W->>DB: lease borrower (SKIP LOCKED), reserve agent, INSERT call
+        W->>DB: COMMIT (pin released)
+        W->>W: dial provider after commit
+    end
+    Note over L: next pacing tick
+    L->>DB: tx 1: UPDATE P1 SET revoked = true (leader-only); COMMIT
+    Note over DB,W: from here no new pin on P1 can succeed;<br/>units the worker still holds are dropped
+    L->>DB: tx 2: BEGIN; lock campaign FOR NO KEY UPDATE
+    L->>DB: SELECT P1 FOR UPDATE
+    Note over L,DB: waits for call transactions that pinned P1 before tx 1 committed
+    DB-->>L: granted once those calls committed or rolled back
+    L->>DB: load snapshot (now counts every call P1 will ever produce)
+    L->>DB: log decision, INSERT permit P2; COMMIT
+```
+
 ## One progressive call, end to end
 
 1. **Pacing tick (leader only).** `leader.try_lead` renews or takes the campaign lease. A
