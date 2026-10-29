@@ -81,7 +81,7 @@ def test_provider_unreachable_keeps_trying_then_gives_up(conn):
     cid, c = _dial(conn, FakeProvider(lambda k: __import__("smartdialer.providers.interface", fromlist=["x"]).DialUncertain("t")))
     conn.execute("UPDATE campaigns SET settings = settings || '{\"reconcile_pre_dial_s\": 0, \"reconcile_give_up_s\": 3600}'")
     assert reaper.run(conn, {"A": down}, "w")["reconciled"] == [], "unknown: keep the reservation, retry later"
-    conn.execute("UPDATE calls SET last_reconciled_at = NULL")
+    conn.execute("UPDATE calls SET reconcile_lease_until = NULL")   # retry pause is over
     conn.execute("UPDATE campaigns SET settings = settings || '{\"reconcile_give_up_s\": 0}'")
     assert reaper.run(conn, {"A": down}, "w")["reconciled"] == [(str(c["id"]), "TIMEOUT")]
     process_batch(conn, "w")
@@ -100,3 +100,49 @@ def test_status_poll_fills_in_missing_events(conn):
     process_batch(conn, "w")
     call = conn.execute("SELECT state, duration_s, answered_inferred FROM calls").fetchone()
     assert call == {"state": "COMPLETED", "duration_s": 88.0, "answered_inferred": True}
+
+
+class _SlowPoll(FakeProvider):
+    """Runs `during` while the status poll is in flight, standing in for a slow provider."""
+    def __init__(self, during=None, status="INITIATED"):
+        super().__init__()
+        self.during, self.status, self.polls = during, status, 0
+
+    def get_call_status(self, key):
+        self.polls += 1
+        if self.during:
+            self.during()
+        return CallStatus(self.status, "pc-x")
+
+
+def test_only_the_lease_owner_reconciles_a_call(dsn, conn):
+    """w1 is still polling (slow provider) long after the old 2 s pause: w2 must not poll the same
+    call. Before the lease, w2 and w3 re-polled calls w1 was still waiting on."""
+    from smartdialer.db import connect
+    _, c = _dial(conn, FakeProvider())
+    conn.execute("UPDATE campaigns SET settings = settings || '{\"reconcile_in_flight_s\": 0}'")
+    p2 = _SlowPoll()
+    with connect(dsn) as conn2:
+        def meanwhile():
+            conn2.execute("UPDATE calls SET last_reconciled_at = now() - interval '1 hour'")
+            assert reaper.reconcile_calls(conn2, {"A": p2}, "w2") == []
+        w1 = _SlowPoll(meanwhile, status="RINGING")
+        assert reaper.reconcile_calls(conn, {"A": w1}, "w1") == [(str(c["id"]), "RINGING")]
+    assert (w1.polls, p2.polls) == (1, 0)
+    assert conn.execute("SELECT reconcile_owner FROM calls").fetchone()["reconcile_owner"] is None
+
+
+def test_reaper_that_lost_its_lease_cannot_write(dsn, conn):
+    """w1 stalls past its lease; w2 takes the call over and writes its answer. When w1 finally
+    returns, its stale answer is dropped: exactly one reconcile event in the inbox, w2's."""
+    from smartdialer.db import connect
+    _, c = _dial(conn, FakeProvider())
+    conn.execute("UPDATE campaigns SET settings = settings || '{\"reconcile_in_flight_s\": 0}'")
+    p2 = _SlowPoll(status="COMPLETED")
+    with connect(dsn) as conn2:
+        def stall():
+            conn2.execute("UPDATE calls SET reconcile_lease_until = now() - interval '1 second'")   # lease ran out
+            assert reaper.reconcile_calls(conn2, {"A": p2}, "w2") == [(str(c["id"]), "COMPLETED")]
+        assert reaper.reconcile_calls(conn, {"A": _SlowPoll(stall, status="RINGING")}, "w1") == []
+    events = conn.execute("SELECT event_type FROM provider_events WHERE provider_event_id LIKE 'reconcile:%'").fetchall()
+    assert [e["event_type"] for e in events] == ["COMPLETED"]

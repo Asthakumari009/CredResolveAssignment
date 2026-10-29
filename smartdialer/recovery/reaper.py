@@ -25,20 +25,25 @@ from smartdialer.transitions import advance_call, set_agent_state
 
 log = logging.getLogger(__name__)
 D = CampaignSettings()
-_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="reconcile")   # HTTP only, no DB in threads
+POOL_SIZE = 16
+_POOL = ThreadPoolExecutor(max_workers=POOL_SIZE, thread_name_prefix="reconcile")   # HTTP only, no DB in threads
+LEASE_S = 10      # longer than one status poll (client timeout 3 s); a claim is never bigger than the pool
+RETRY_S = 2       # pause between polls of the same call
 
 
-def reconcile_calls(conn, providers: dict, worker_id: str, limit: int = 50) -> list[tuple[str, str]]:
-    # CONCURRENCY: claiming with SKIP LOCKED plus the last_reconciled_at bump means two reapers do
-    # not poll the same call in the same pass. Even if they did, polling is read-only and the
-    # synthetic event id is deterministic, so the inbox would drop the second copy.
+def reconcile_calls(conn, providers: dict, worker_id: str, limit: int = POOL_SIZE) -> list[tuple[str, str]]:
+    # CONCURRENCY: SKIP LOCKED makes concurrent claims disjoint, and the lease (owner + expiry,
+    # committed with the claim) keeps the call out of every other reaper's claim while this one
+    # polls the provider. The result is written only if this worker still owns the lease (fenced
+    # UPDATE below), so a reaper that stalled past its lease cannot overwrite the new owner's work.
     claimed = conn.execute(
-        """UPDATE calls c SET last_reconciled_at = now(), reconcile_attempts = c.reconcile_attempts + 1
+        """UPDATE calls c SET last_reconciled_at = now(), reconcile_attempts = c.reconcile_attempts + 1,
+                  reconcile_owner = %(me)s, reconcile_lease_until = now() + make_interval(secs => %(lease)s)
            FROM campaigns k
            WHERE c.id IN (
                SELECT c2.id FROM calls c2 JOIN campaigns k2 ON k2.id = c2.campaign_id
                WHERE c2.state NOT IN ('COMPLETED','FAILED','CANCELLED','ABANDONED','ANSWERED')
-                 AND (c2.last_reconciled_at IS NULL OR c2.last_reconciled_at < now() - interval '2 seconds')
+                 AND (c2.reconcile_lease_until IS NULL OR c2.reconcile_lease_until < now())
                  AND c2.state_changed_at < now() - make_interval(secs => CASE
                        WHEN c2.state IN ('QUEUED','RESERVED')
                             THEN COALESCE((k2.settings->>'reconcile_pre_dial_s')::float, %(pre)s)
@@ -51,9 +56,12 @@ def reconcile_calls(conn, providers: dict, worker_id: str, limit: int = 50) -> l
                      EXTRACT(EPOCH FROM now() - c.state_changed_at) AS stuck_s,
                      COALESCE((k.settings->>'reconcile_give_up_s')::float, %(give_up)s) AS give_up_s""",
         {"pre": D.reconcile_pre_dial_s, "fly": D.reconcile_in_flight_s, "con": D.reconcile_connected_s,
-         "give_up": D.reconcile_give_up_s, "limit": limit}).fetchall()
+         "give_up": D.reconcile_give_up_s, "limit": min(limit, POOL_SIZE), "me": worker_id,
+         "lease": LEASE_S}).fetchall()
 
     # The circuit breaker covers status polls too: while a provider is OPEN, do not hammer it.
+    # Read once per claim. That is enough because a claim never exceeds the pool, so every poll
+    # starts now instead of queueing behind others and reaching a provider that opened meanwhile.
     open_providers = {r["provider_name"] for r in conn.execute(
         "SELECT provider_name FROM provider_health WHERE breaker_state = 'OPEN'")}
 
@@ -67,22 +75,34 @@ def reconcile_calls(conn, providers: dict, worker_id: str, limit: int = 50) -> l
 
     done = []
     # Polls run in parallel: during an outage each one waits for the full client timeout, and
-    # polling 50 calls one by one would freeze this worker for minutes.
+    # polling them one by one would freeze this worker.
     for c, st in _POOL.map(poll, claimed):
         if isinstance(st, ProviderUnavailable):
             if c["stuck_s"] < c["give_up_s"] or c["state"] == "CONNECTED":
                 log.info("reconcile %s: provider unavailable (%s), will retry", c["id"], st)
-                continue
-            st, etype = None, "TIMEOUT"   # ponytail: may orphan a call the provider did place; see INTERVIEW_PREP
+                st = etype = None
+            else:
+                st, etype = None, "TIMEOUT"   # ponytail: may orphan a call the provider did place; see INTERVIEW_PREP
         else:
             etype = st.status
             if etype == "NOT_FOUND" and c["state"] not in ("QUEUED", "RESERVED"):
                 etype = "FAILED"   # we know it was dialed, but the provider lost it
-        conn.execute(
-            """INSERT INTO provider_events (provider_name, provider_event_id, call_id, provider_call_id, event_type, payload)
-               VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (provider_name, provider_event_id) DO NOTHING""",
-            (c["provider_name"], f"reconcile:{c['id']}:{etype}", c["id"], st and st.provider_call_id, etype,
-             json.dumps({"duration_s": st and st.duration_s, "source": "reconcile"})))
+        with conn.transaction():
+            # CONCURRENCY: fenced on the lease owner. If our lease ran out and another reaper took
+            # the call, this matches nothing and our (now stale) answer is dropped.
+            owned = conn.execute(
+                """UPDATE calls SET reconcile_owner = NULL, reconcile_lease_until = now() + make_interval(secs => %s)
+                   WHERE id = %s AND reconcile_owner = %s RETURNING id""", (RETRY_S, c["id"], worker_id)).fetchone()
+            if not owned:
+                log.info("reconcile %s: lease lost to another worker, dropping result", c["id"])
+                continue
+            if etype is None:
+                continue
+            conn.execute(
+                """INSERT INTO provider_events (provider_name, provider_event_id, call_id, provider_call_id, event_type, payload)
+                   VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (provider_name, provider_event_id) DO NOTHING""",
+                (c["provider_name"], f"reconcile:{c['id']}:{etype}", c["id"], st and st.provider_call_id, etype,
+                 json.dumps({"duration_s": st and st.duration_s, "source": "reconcile"})))
         done.append((str(c["id"]), etype))
     return done
 

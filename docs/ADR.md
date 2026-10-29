@@ -131,21 +131,28 @@ Format for each: **Chosen**, **Why**, **Problem it solves**, **What it makes har
   concurrency tests, the demos and the load test. If the loops grow, the fix is the repository
   abstraction this ADR declined.
 
-## ADR-7: Age-based reconciliation, no per-row reaper leases
+## ADR-7: Age-based reconciliation, one reaper per call (lease)
 
 - **Chosen:** The reaper selects calls that have been in a state too long (pre-dial > 5 s,
   INITIATED or RINGING with no news > 60 s) and asks the provider `get_call_status(idempotency key)`.
   It turns the answer into a synthetic inbox event (`reconcile:<call>:<status>`) that goes through
   the normal event path. NOT_FOUND becomes CANCELLED(NOT_DIALED). A provider unreachable for
   `reconcile_give_up_s` becomes FAILED(TIMEOUT). Polls run in parallel and are skipped while the breaker
-  is OPEN.
-- **Why:** The provider's answer is idempotent, and the inbox dedupes on the synthetic event id, so two
-  reapers polling the same call cannot double-apply. Per-row leases would add a lease column,
-  expiry logic and a second crash window for no extra safety.
+  is OPEN. A reaper claims calls with `FOR UPDATE SKIP LOCKED` and takes a 10 s lease on each
+  (`reconcile_owner`, `reconcile_lease_until`). It writes the result only if it still owns the lease
+  (fenced UPDATE in the same transaction as the inbox insert). A claim is never larger than the poll
+  pool (16), so no poll waits in a queue.
+- **Why:** The first version had no lease, only a 2 s pause between polls of a call, reasoning that
+  the inbox dedupes the synthetic event id. That holds only when two reapers get the same answer. In
+  the outage demo a poll takes the full 3 s client timeout, so a second and third reaper re-polled
+  calls the first was still waiting on, and two reapers can disagree (one gives up with TIMEOUT,
+  the other reads COMPLETED): different ids, both inserted, the first applied wins. Polls queued
+  behind a full pool also reached the provider seconds after the breaker check, after it had opened.
+  If a lease holder crashes, the call is simply claimable again after 10 s.
 - **Problem it solves:** Both crash windows (C3): a crash after commit before dial (provider says NOT_FOUND)
   and a crash after the provider accepted, before INITIATED was recorded (provider says RINGING
   or later). Neither is guessed. Both are asked.
-- **What it makes harder:** Duplicate polling under load (harmless, but it is provider traffic). Two
+- **What it makes harder:** Two more columns, and a crashed reaper delays its calls by one lease. Two
   known residual risks. First, a paused (not dead) worker can dial after reconciliation already
   got NOT_FOUND. It then sees the call CANCELLED and hangs up at once, so the borrower may hear one
   ring that is cut off. Second, the TIMEOUT give-up may fail a call the provider did place. Its events still
