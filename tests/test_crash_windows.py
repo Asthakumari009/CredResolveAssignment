@@ -121,7 +121,7 @@ def test_w2_crash_after_provider_accepted(dsn, conn, provider):
     for et, dur in (("ANSWERED", None), ("COMPLETED", 61.0)):
         conn.execute("INSERT INTO provider_events (provider_name, provider_event_id, call_id, event_type, payload)"
                      " VALUES ('A', %s, %s, %s, %s)", (uuid.uuid4().hex, call_id, et, json.dumps({"duration_s": dur})))
-    process_batch(conn, "rescuer")
+        process_batch(conn, "rescuer")   # one at a time, as they would arrive from a live provider
     s = _state(conn)
     assert s["call"]["state"] == "COMPLETED" and s["agent"] == "WRAP_UP" and s["borrower"]["state"] == "DONE"
     assert conn.execute("SELECT count(*) AS n FROM calls").fetchone()["n"] == 1, "no redial"
@@ -149,6 +149,9 @@ def _one_dialed_call(conn, provider, mode="PROGRESSIVE", agents=1):
 
 
 def test_crash_while_applying_answered_rolls_back(dsn, conn, provider):
+    """The worker dies inside the ANSWERED transaction, so no agent was bridged while the borrower
+    was on the line. When another worker gets to it, COMPLETED is already in the inbox: the borrower
+    was abandoned. It must be recorded as ABANDONED and counted, never as CONNECTED."""
     call = _one_dialed_call(conn, provider)
     _post(conn, call, "ANSWERED")
     _run_crashing(_process_and_crash, dsn, "event_answered_before_commit")
@@ -158,9 +161,10 @@ def test_crash_while_applying_answered_rolls_back(dsn, conn, provider):
     _post(conn, call, "COMPLETED", 33.0)
     process_batch(conn, "survivor")
     s = _state(conn)
-    assert s["call"]["state"] == "COMPLETED" and s["agent"] == "WRAP_UP" and s["borrower"]["state"] == "DONE"
+    assert s["call"]["state"] == "ABANDONED" and s["agent"] == "AVAILABLE" and s["borrower"]["state"] == "DONE"
     assert [r["to_state"] for r in conn.execute("SELECT to_state FROM call_transitions ORDER BY id")] == \
-        ["RESERVED", "INITIATED", "ANSWERED", "CONNECTED", "COMPLETED"]
+        ["RESERVED", "INITIATED", "ANSWERED", "ABANDONED"]
+    assert conn.execute("SELECT last_outcome FROM borrowers").fetchone()["last_outcome"] == "ABANDONED"
     assert all(n == 0 for _, n in check_all(conn))
 
 
@@ -168,10 +172,10 @@ def test_crash_after_answered_committed_predictive_no_agent(dsn, conn, provider)
     """ANSWERED committed (no agent free), worker dies. Another worker's answer-hold abandons it
     after max hold; the late COMPLETED is then STALE_IGNORED. Consistent, and counted."""
     call = _one_dialed_call(conn, provider, mode="PREDICTIVE", agents=0)
-    conn.execute("UPDATE campaigns SET settings = settings || '{\"max_answer_hold_ms\": 0}'")
     _post(conn, call, "ANSWERED")
     _run_crashing(_process_and_crash, dsn, "event_answered_after_commit")
     assert _state(conn)["call"]["state"] == "ANSWERED"
+    conn.execute("UPDATE campaigns SET settings = settings || '{\"max_answer_hold_ms\": 0}'")   # hold time is up
     out = answer_hold.run(conn, {"A": provider}, "survivor")
     assert out == {"connected": 0, "abandoned": 1}
     _post(conn, call, "COMPLETED", 5.0)

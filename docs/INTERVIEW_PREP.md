@@ -39,16 +39,21 @@ followed by a write is exactly the check-then-act race the UPDATE closes.
 
 - The webhook receiver (`events/webhook_api.receive`) has already inserted ANSWERED into
   `provider_events`. Receiving does not depend on any worker.
-- **Crash before COMMIT** (`event_answered_before_commit`): Postgres rolls the transaction back. The inbox
-  row is still unprocessed, and another worker's `events/processor.process_one` claims it and applies it.
+- **Crash before COMMIT** (`event_answered_before_commit`): Postgres rolls the transaction back, so no
+  agent was bridged. The inbox row is still unprocessed, and another worker's `events/processor.process_one`
+  claims it. By then the hold time has passed and COMPLETED is waiting in the inbox, so the borrower was abandoned:
+  the call is recorded ANSWERED then ABANDONED (`_answer_too_late`), counted toward the abandon budget, and the
+  agent is released. It is never recorded as CONNECTED, because nobody was.
 - **Crash after COMMIT** (`event_answered_after_commit`): ANSWERED is durable, and the agent is already
   CONNECTED. The next worker simply processes COMPLETED.
 - COMPLETED may arrive while ANSWERED is still unprocessed. Per-call FIFO in `process_one` (ordered by
   `sequence, id`, with a 1500 ms hold for a missing sequence number) applies ANSWERED first. If ANSWERED were
   truly lost, `call_sm.ALLOWED` accepts COMPLETED from any live state, and the answer is inferred from
   `duration_s > 0` (`answered_inferred`).
-- Both variants end in the same state: call COMPLETED, agent WRAP_UP then AVAILABLE, borrower DONE,
-  and all invariants pass.
+- Rule: an ANSWERED applied more than `max_answer_hold_ms` after the answer, or with COMPLETED already in
+  the inbox, is an abandon. That gives the same outcome as `make demo-out-of-order`, where COMPLETED is applied before ANSWERED:
+  the borrower's outcome is ABANDONED and it counts. Variant 2 ends COMPLETED / CONNECTED with no abandon. All
+  invariants pass in both.
 
 ## 4. Predicted 70% answer rate, it drops to 10%. And the reverse.
 

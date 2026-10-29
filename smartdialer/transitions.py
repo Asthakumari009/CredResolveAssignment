@@ -102,8 +102,11 @@ def record_creation(conn, call_id, state, worker_id):
 
 
 def advance_call(conn, call_id, target, *, worker_id, reason=None, cause_event_id=None,
-                 provider_call_id=None, duration_s=None, rng=None):
-    """Move a call towards `target`. Returns (verdict, call_row_after). Must run inside a transaction."""
+                 provider_call_id=None, duration_s=None, rng=None, bridge=True):
+    """Move a call towards `target`. Returns (verdict, call_row_after). Must run inside a transaction.
+
+    bridge=False (ANSWERED only): record the answer but do not bridge an agent, because it is
+    known to be too late for one (see events/processor.py). The caller abandons the call next."""
     target = S(target)
     call = conn.execute("SELECT * FROM calls WHERE id = %s FOR UPDATE", (call_id,)).fetchone()
     if call is None:
@@ -140,9 +143,9 @@ def advance_call(conn, call_id, target, *, worker_id, reason=None, cause_event_i
 
     if target in TERMINAL:
         _settle_borrower(conn, call, rng)
-    if call["agent_id"] is not None:
+    if call["agent_id"] is not None and (bridge or target != S.ANSWERED):
         _sync_agent(conn, call, worker_id)
-    if target == S.ANSWERED:
+    if target == S.ANSWERED and bridge:
         call = try_connect(conn, call, worker_id)
     return Verdict.APPLY, call
 

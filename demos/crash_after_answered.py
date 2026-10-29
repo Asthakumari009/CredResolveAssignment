@@ -1,10 +1,12 @@
 """Demo: the provider sends ANSWERED, the worker processing it crashes, then COMPLETED arrives.
 
 Variant 1: SIGKILL inside the transaction applying ANSWERED (before COMMIT): Postgres rolls it
-           back, the inbox row stays unprocessed, another worker applies it later.
+           back, the inbox row stays unprocessed. Nobody bridged an agent while the borrower was
+           on the line, and by the time another worker applies ANSWERED the call has ended
+           (COMPLETED is waiting in the inbox). Expected: ABANDONED, counted toward the abandon
+           budget, agent AVAILABLE, borrower DONE and not redialed. Same outcome as out_of_order.
 Variant 2: SIGKILL right after COMMIT: ANSWERED (and the agent bridge) is durable; another
-           worker just carries on with COMPLETED.
-Both must end in the same consistent state: COMPLETED, agent in WRAP_UP then AVAILABLE, borrower DONE.
+           worker just carries on with COMPLETED. Expected: COMPLETED, CONNECTED, not an abandon.
 """
 import time
 
@@ -13,7 +15,7 @@ from demos.setup import campaign
 from smartdialer.invariants import report
 
 
-def run(conn, crash_at, title):
+def run(conn, crash_at, title, expect, expect_abandons):
     header(title)
     control("A", auto_events=True, answer_rate=1.0, error_rate=0.0, busy_rate=0.0, talk_mean_s=100, time_scale=0.03)
     campaign(conn, agents=1, borrowers=1)
@@ -34,18 +36,27 @@ def run(conn, crash_at, title):
     final = conn.execute("SELECT c.state AS call, a.state AS agent, b.state AS borrower, b.last_outcome"
                          " FROM calls c, agents a, borrowers b").fetchone()
     print(f"\n  final: {final}")
-    return ok and final["call"] == "COMPLETED" and final["last_outcome"] == "CONNECTED" and report(conn)
+    abandons = conn.execute("SELECT count(*) AS n FROM calls WHERE answered_at IS NOT NULL AND connected_at IS NULL"
+                            " AND state IN ('COMPLETED','FAILED','CANCELLED','ABANDONED')").fetchone()["n"]
+    print(f"  counted toward the abandon budget: {abandons}")
+    return ok and final == expect and abandons == expect_abandons and report(conn)
 
 
 def main():
     with services():
+        # Variant 1: the ANSWERED transaction rolled back, so no agent was bridged while the
+        # borrower was on the line. By the time another worker applies it, the hold time is long
+        # gone and COMPLETED is already in the inbox: that borrower was abandoned, and it counts.
         ok1 = run(fresh_db(), "event_answered_before_commit",
-                  "CRASH AFTER ANSWERED, variant 1: worker SIGKILLed while applying ANSWERED (before COMMIT)")
+                  "CRASH AFTER ANSWERED, variant 1: worker SIGKILLed while applying ANSWERED (before COMMIT)",
+                  {"call": "ABANDONED", "agent": "AVAILABLE", "borrower": "DONE", "last_outcome": "ABANDONED"}, 1)
         import httpx
         httpx.post("http://127.0.0.1:8001/control/reset")
         conn = fresh_db()
+        # Variant 2: ANSWERED and the agent bridge committed before the crash: a real conversation.
         ok2 = run(conn, "event_answered_after_commit",
-                  "CRASH AFTER ANSWERED, variant 2: worker SIGKILLed right after committing ANSWERED")
+                  "CRASH AFTER ANSWERED, variant 2: worker SIGKILLed right after committing ANSWERED",
+                  {"call": "COMPLETED", "agent": "AVAILABLE", "borrower": "DONE", "last_outcome": "CONNECTED"}, 0)
         finish(conn, ok1 and ok2)
 
 

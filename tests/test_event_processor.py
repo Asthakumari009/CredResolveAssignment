@@ -81,7 +81,9 @@ def _post_seq(conn, call_id, etype, seq, duration_s=None, age_ms=0):
 
 def test_resequencing_recovers_a_late_answered(conn):
     """Provider numbers events. COMPLETED (seq 3) arrives before ANSWERED (seq 2) and RINGING (seq 1)
-    is lost. Within the hold window the gap fills: the call is CONNECTED then COMPLETED, no false abandon."""
+    is lost. Resequencing makes sure ANSWERED is applied, in order, so the answer is recorded
+    with its own time. But the call had already ended before anyone bridged an agent: ABANDONED,
+    counted, and the late COMPLETED is a no-op."""
     call = _one_call(conn)
     _post_seq(conn, call, "COMPLETED", 3, duration_s=50)
     process_batch(conn, "w")
@@ -89,8 +91,8 @@ def test_resequencing_recovers_a_late_answered(conn):
     _post_seq(conn, call, "ANSWERED", 2, age_ms=2000)   # arrived a while ago: ANSWERED's own hold has expired
     conn.execute("UPDATE provider_events SET next_attempt_at = now()")
     process_batch(conn, "w")
-    assert transitions(conn, call)[-3:] == ["ANSWERED", "CONNECTED", "COMPLETED"]
-    assert conn.execute("SELECT last_outcome FROM borrowers").fetchone()["last_outcome"] == "CONNECTED"
+    assert transitions(conn, call)[-2:] == ["ANSWERED", "ABANDONED"]
+    assert conn.execute("SELECT last_outcome FROM borrowers").fetchone()["last_outcome"] == "ABANDONED"
 
 
 def test_resequencing_gives_up_after_window(conn):
@@ -156,7 +158,13 @@ def test_property_random_event_streams(conn, seed):
         post(conn, call, e, event_id=eid, duration_s=60.0 if e == "COMPLETED" else None)
     process_batch(conn, "w")
     state = conn.execute("SELECT state FROM calls").fetchone()["state"]
-    assert state in ("COMPLETED", "FAILED"), (life, stream, state)
+    outcome = conn.execute("SELECT last_outcome FROM borrowers").fetchone()["last_outcome"]
+    if "ANSWERED" in life:
+        # All events were in the inbox before any was processed, so no agent was bridged before the
+        # call ended. Whichever order they are applied in, it ends as an abandon, and is counted.
+        assert state in ("COMPLETED", "ABANDONED") and outcome == "ABANDONED", (life, stream, state, outcome)
+    else:
+        assert state == "FAILED", (life, stream, state)
     assert all(n == 0 for _, n in check_all(conn)), check_all(conn)
 
 
@@ -169,3 +177,48 @@ def test_webhook_stores_once(dsn, conn):
         assert client.post("/events/A", json=body).json() == {"stored": True, "duplicate": False}
         assert client.post("/events/A", json=body).json() == {"stored": False, "duplicate": True}
     assert conn.execute("SELECT count(*) AS n FROM provider_events").fetchone()["n"] == 1
+
+
+def _abandon_counted(conn, cid):
+    from smartdialer.config import load_settings
+    from smartdialer.safety.snapshot import load_snapshot
+    snap = load_snapshot(conn, cid, load_settings(conn, cid), "w", None)
+    return snap.abandon_count, snap.abandon_n
+
+
+def test_answer_processed_after_hold_time_is_an_abandon(conn):
+    """ANSWERED that reaches a worker after max_answer_hold_ms (backlog, crashed worker): nobody was
+    bridged in time. ABANDONED, agent released, borrower not redialed, counted, call hung up."""
+    provider = FakeProvider()
+    cid = make_campaign(conn, agents=1, borrowers=1, settings={"max_answer_hold_ms": 500})
+    issue_permit(conn, cid, approved=1)
+    [c] = CallAllocator(SafetyController("w"), {"A": provider}, "w").dispatch(conn, cid, 1, 3)
+    post(conn, c["id"], "ANSWERED")
+    conn.execute("UPDATE provider_events SET received_at = now() - interval '3 seconds'")
+    process_batch(conn, "w", providers={"A": provider})
+    assert conn.execute("SELECT state, connected_at FROM calls").fetchone() == {"state": "ABANDONED", "connected_at": None}
+    assert transitions(conn, c["id"]) == ["RESERVED", "INITIATED", "ANSWERED", "ABANDONED"]
+    assert conn.execute("SELECT state FROM agents").fetchone()["state"] == "AVAILABLE"
+    assert conn.execute("SELECT state, last_outcome FROM borrowers").fetchone() == {"state": "DONE", "last_outcome": "ABANDONED"}
+    assert _abandon_counted(conn, cid) == (1, 1)
+    assert provider.hangups == [conn.execute("SELECT provider_call_id FROM calls").fetchone()["provider_call_id"]]
+    assert all(n == 0 for _, n in check_all(conn))
+
+
+def test_answer_with_end_already_in_inbox_is_an_abandon(conn):
+    """Same outcome as out_of_order (COMPLETED applied before ANSWERED): both count as an abandon."""
+    call = _one_call(conn)
+    post(conn, call, "ANSWERED")
+    post(conn, call, "COMPLETED", duration_s=20.0)
+    process_batch(conn, "w")
+    assert conn.execute("SELECT state FROM calls").fetchone()["state"] == "ABANDONED"
+    assert results(conn) == ["APPLIED", "STALE_IGNORED"]
+    cid = conn.execute("SELECT campaign_id FROM calls").fetchone()["campaign_id"]
+    assert _abandon_counted(conn, cid) == (1, 1)
+
+
+def test_prompt_answer_still_connects(conn):
+    call = _one_call(conn)
+    post(conn, call, "ANSWERED")
+    process_batch(conn, "w")
+    assert conn.execute("SELECT state FROM calls").fetchone()["state"] == "CONNECTED"

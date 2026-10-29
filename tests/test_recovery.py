@@ -62,9 +62,9 @@ def test_agent_leaves_after_answer_call_is_handed_off(conn):
 def test_abandon_after_hold_when_nobody_comes(conn):
     fake = FakeProvider()
     cid, c = _dial(conn, fake, agents=0, mode="PREDICTIVE")
-    conn.execute("UPDATE campaigns SET settings = settings || '{\"max_answer_hold_ms\": 0}'")
     _post(conn, c["id"], "ANSWERED")
     process_batch(conn, "w")
+    conn.execute("UPDATE campaigns SET settings = settings || '{\"max_answer_hold_ms\": 0}'")   # hold time is up
     assert answer_hold.run(conn, {"A": fake}, "w") == {"connected": 0, "abandoned": 1}
     assert conn.execute("SELECT state, failure_reason FROM calls").fetchone() == {"state": "ABANDONED", "failure_reason": "NO_AGENT_IN_TIME"}
     assert len(fake.hangups) == 1, "polite message + hangup"

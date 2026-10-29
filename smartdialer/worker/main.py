@@ -61,7 +61,7 @@ class Worker:
                 self.next_tick[camp["id"]] = now + cfg.pacing_tick_ms / 1000
                 self.pace(camp["id"], camp["mode"], cfg)
             work += len(self.allocator.dispatch(self.conn, camp["id"], DISPATCH_PER_PASS, cfg.max_attempts))
-        work += process_batch(self.conn, self.id, limit=200)
+        work += process_batch(self.conn, self.id, limit=200, providers=self.providers)
         work += sum(answer_hold.run(self.conn, self.providers, self.id).values())
         if now - self.last_reap >= 1.0:
             self.last_reap = now
