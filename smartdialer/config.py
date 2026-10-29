@@ -19,6 +19,7 @@ class CampaignSettings:
     soon_free_discount: float = 0.5
     # Predictive answer handling
     max_answer_hold_ms: int = 2000
+    event_lag_window_s: float = 10.0        # EVENT_LAG: p90 over events received in this window
     # Safety Controller rules
     stale_snapshot_ms: int = 1000
     cold_start_samples: int = 50

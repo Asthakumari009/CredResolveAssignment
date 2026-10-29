@@ -20,7 +20,7 @@ Start with **[docs/FINAL_ANSWER.md](docs/FINAL_ANSWER.md)** (under 300 words), t
   `# CONCURRENCY:` comment.
 - **Pacing cannot dial.** It only proposes. The Safety Controller approves a number of calls as a permit, and every
   decision is logged to `safety_decisions` with its reason codes (abandon budget, overdial cap, cold start,
-  answer-rate drift, agent drop, provider health, calling window).
+  answer-rate drift, agent drop, provider health, event lag, calling window).
 - **Crashes lose nothing and guess nothing.** Provider events land in an inbox (deduplicated, per-call
   ordered). A worker can die at any point; another one reconciles by idempotency key with the provider.
 - **Decision logic is pure** and shared by the live workers and a discrete-event simulator.
@@ -73,7 +73,7 @@ invariant checks over the history tables and prints `RESULT: PASS` or `FAIL`.
 | `make demo-worker-crash` | Worker SIGKILLs itself after commit before dial, and after dial before INITIATED. Another worker reconciles both by idempotency key |
 | `make demo-crash-after-answered` | Worker SIGKILLs itself while applying ANSWERED, before and after COMMIT. Before: an abandon, counted. After: connected |
 | `make demo-agent-drop` | 40 of 100 agents go offline within 3 s during predictive dialing: forced progressive within one tick of the threshold |
-| `make demo-provider-outage` | Provider B hangs for 25 s: breaker opens, dialing stops, HALF_OPEN probes, gradual ramp back up |
+| `make demo-provider-outage` | Provider B hangs for 25 s: breaker opens, dialing stops, HALF_OPEN probes, gradual ramp back up. Then its webhooks stall 6 s: EVENT_LAG rejects all dials until the inbox catches up |
 | `make demo-answer-rate-shock` | Answer rate jumps 20% to 70% (and drops 70% to 10%), in the simulator |
 
 ## Other commands

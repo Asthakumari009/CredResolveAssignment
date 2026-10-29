@@ -144,6 +144,7 @@ sequenceDiagram
 | Crash while applying ANSWERED | The event stays in the inbox until processed; any worker resumes. An answer applied after the hold time, or after the call ended, is ABANDONED and counted, never CONNECTED | `make demo-crash-after-answered` |
 | Agents drop | HARD_RATIO_CAP immediately, AGENT_DROP forces progressive | `make demo-agent-drop` |
 | Provider outage | Breaker opens, decisions REJECT, HALF_OPEN probes, recovery ramps from 20% to 100% over 20 s | `make demo-provider-outage` |
+| Provider events arrive late (webhook stall, overloaded delivery) | EVENT_LAG: p90 of provider-time-to-applied over 10 s, or the oldest unprocessed event, above `max_answer_hold_ms` -> REJECT every dial, progressive included, until the inbox catches up | `make demo-provider-outage` (second phase) |
 | Answer-rate shock | Hard cap first, ANSWER_RATE_DRIFT forces progressive | `make demo-answer-rate-shock` |
 | Two workers dial the same borrower / reserve the same agent | SKIP LOCKED + state re-check; partial unique indexes as backstop | `tests/test_races.py` (50 processes) |
 | Deposed pacing leader | Fencing token checked in the permit claim and the per-call pin | `tests/test_permits.py` |

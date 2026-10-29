@@ -14,7 +14,7 @@ SELECT now() AS taken_at,
        COALESCE((SELECT breaker_state FROM provider_health WHERE provider_name = c.provider_name), 'CLOSED') AS breaker_state,
        (SELECT EXTRACT(EPOCH FROM now() - opened_at) FROM provider_health WHERE provider_name = c.provider_name)
            AS breaker_age_s,
-       a.*, k.*, w.*, ab.*, avgs.*,
+       a.*, k.*, w.*, ab.*, avgs.*, el.*,
        COALESCE((SELECT max((s.snapshot->>'staffed')::int) FROM safety_decisions s
                  WHERE s.campaign_id = c.id AND s.at > now() - %(drop_window)s * interval '1 second'), 0)
            AS max_staffed_recent
@@ -55,7 +55,18 @@ LATERAL (SELECT avg(EXTRACT(EPOCH FROM answered_at - dialed_at)) AS avg_setup_s,
                 avg(duration_s) FILTER (WHERE connected_at IS NOT NULL) AS avg_talk_s
          FROM (SELECT answered_at, dialed_at, duration_s, connected_at FROM calls
                WHERE campaign_id = c.id AND state = 'COMPLETED'
-               ORDER BY ended_at DESC LIMIT 200) z) avgs
+               ORDER BY ended_at DESC LIMIT 200) z) avgs,
+-- Event lag: how late provider events reach a decision, measured from the provider's own
+-- timestamp (LEAST with received_at, so a provider clock running ahead cannot hide lag). p90 over
+-- the recent window, or the age of the oldest event still waiting, whichever is worse.
+LATERAL (SELECT COALESCE(GREATEST(
+           (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM
+                       COALESCE(e.processed_at, now()) - LEAST(COALESCE(e.provider_timestamp, e.received_at), e.received_at)))
+              FROM provider_events e JOIN calls ec ON ec.id = e.call_id
+              WHERE ec.campaign_id = c.id AND e.received_at > now() - %(lag_window)s * interval '1 second'),
+           (SELECT EXTRACT(EPOCH FROM now() - min(LEAST(COALESCE(e.provider_timestamp, e.received_at), e.received_at)))
+              FROM provider_events e JOIN calls ec ON ec.id = e.call_id
+              WHERE ec.campaign_id = c.id AND e.processed_at IS NULL)), 0) * 1000 AS event_lag_ms) el
 WHERE c.id = %(campaign)s
 """
 
@@ -63,7 +74,7 @@ WHERE c.id = %(campaign)s
 def load_snapshot(conn, campaign_id: int, cfg: CampaignSettings, worker_id: str, fencing_token: int | None) -> Snapshot:
     r = conn.execute(_SQL, {"campaign": campaign_id, "worker": worker_id, "wall_clock": clock.now(), "short": cfg.short_window,
                             "window": cfg.answer_window, "abandon_window": cfg.abandon_window,
-                            "drop_window": cfg.agent_drop_window_s}).fetchone()
+                            "drop_window": cfg.agent_drop_window_s, "lag_window": cfg.event_lag_window_s}).fetchone()
     return Snapshot(
         campaign_id=campaign_id,
         taken_at=r["taken_at"],
@@ -81,4 +92,5 @@ def load_snapshot(conn, campaign_id: int, cfg: CampaignSettings, worker_id: str,
         avg_talk_s=float(r["avg_talk_s"]) if r["avg_talk_s"] is not None else None,
         max_staffed_recent=r["max_staffed_recent"],
         breaker_age_s=float(r["breaker_age_s"]) if r["breaker_age_s"] is not None else None,
+        event_lag_ms=float(r["event_lag_ms"]),
     )

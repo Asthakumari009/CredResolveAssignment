@@ -37,7 +37,8 @@ def sample(conn, t0):
 
 
 def main():
-    header("PROVIDER OUTAGE: Provider B times out on everything for 25 s, then recovers")
+    header("PROVIDER OUTAGE: Provider B times out on everything for 25 s, then recovers;\n"
+           "then its webhooks stall for 6 s and arrive late (EVENT_LAG)")
     with services():
         conn = fresh_db()
         control("B", answer_rate=0.35, talk_mean_s=40, time_scale=0.05)
@@ -66,6 +67,24 @@ def main():
             " AND outcome <> 'REJECT'").fetchone() and conn.execute(
             "SELECT breaker_state FROM provider_health WHERE provider_name = 'B'").fetchone()["breaker_state"] == "CLOSED", 40, "recovery")
         time.sleep(6)
+
+        # Second failure: the API is fine but event delivery stalls, so ANSWERED reaches us late.
+        # Nothing can bridge an answer nobody has seen, so EVENT_LAG must reject every new dial
+        # (not fall back to progressive) until the inbox has caught up.
+        say("WEBHOOK STALL: Provider B holds back every event for 6 s, then delivers them all late")
+        stall_on = conn.execute("SELECT now() AS t").fetchone()["t"]
+        control("B", webhooks_down=True)
+        time.sleep(6)
+        control("B", webhooks_down=False)
+        stall_off = conn.execute("SELECT now() AS t").fetchone()["t"]
+        say("webhooks flowing again")
+        lag_fired = wait_for(lambda: conn.execute(
+            "SELECT 1 FROM safety_decisions WHERE at > %s AND reason_codes = '{EVENT_LAG}'", (stall_off,)).fetchone(),
+            10, "EVENT_LAG")
+        lag_cleared = lag_fired and wait_for(lambda: conn.execute(
+            """SELECT 1 FROM safety_decisions WHERE at > (SELECT max(at) FROM safety_decisions WHERE 'EVENT_LAG' = ANY(reason_codes))
+                 AND outcome <> 'REJECT' AND approved_count > 0""").fetchone(), 40, "EVENT_LAG to clear")
+        time.sleep(2)
         stop_flag.set()
         th.join()
         stop(*workers)
@@ -88,10 +107,19 @@ def main():
                              (outage_off,)).fetchone()
             print(f"  HALF_OPEN probe calls placed {label}: {r['n']}, never accepted by the provider: {r['failed']}")
         ramp = [r["approved_count"] for r in conn.execute(
-            """SELECT approved_count FROM safety_decisions WHERE at > %s AND snapshot->>'breaker_state' = 'CLOSED'
-               ORDER BY id LIMIT 8""", (outage_off,))]
+            """SELECT approved_count FROM safety_decisions WHERE at > %s AND at < %s AND snapshot->>'breaker_state' = 'CLOSED'
+               ORDER BY id LIMIT 8""", (outage_off, stall_on))]
         print(f"  approvals after the breaker closed again (ramping from 20%): {ramp}")
-        finish(conn, opened > 0 and dialed_while_open == 0 and bool(recovered))
+        lag = conn.execute(
+            """SELECT count(*) AS n, min(at) AS first, max(at) AS last, max((snapshot->>'event_lag_ms')::float) AS worst
+               FROM safety_decisions WHERE at > %s AND 'EVENT_LAG' = ANY(reason_codes)""", (stall_off,)).fetchone()
+        print(f"\n  EVENT_LAG after the webhook stall: {lag['n']} decisions rejected, worst lag {lag['worst'] or 0:.0f} ms"
+              f" (max_answer_hold_ms 2000)")
+        if lag["first"]:
+            print(f"    first EVENT_LAG reject {(lag['first'] - stall_off).total_seconds():.1f} s after delivery resumed;"
+                  f" dialing held for {(lag['last'] - lag['first']).total_seconds():.1f} s, then resumed: {bool(lag_cleared)}")
+        print("    (while delivery is fully stalled nothing arrives, so the lag is only visible once events land)")
+        finish(conn, opened > 0 and dialed_while_open == 0 and bool(recovered) and bool(lag_fired) and bool(lag_cleared))
 
 
 if __name__ == "__main__":

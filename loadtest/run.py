@@ -89,6 +89,17 @@ def run_once(n_workers: int, seconds: float, agents: int, borrowers: int) -> dic
                                 SELECT extract(epoch FROM at - lag(at) OVER (ORDER BY id)) * 1000 AS gap
                                 FROM safety_decisions) g""").fetchone()
     permits = conn.execute("SELECT sum(approved_count) AS approved, sum(consumed_count) AS claimed FROM dial_permits").fetchone()
+    # Abandons: answered (or inferred answered) and finished without ever being bridged to an agent.
+    ab = conn.execute("""SELECT count(*) AS answered, count(*) FILTER (WHERE connected_at IS NULL) AS abandoned
+                         FROM calls WHERE (answered_at IS NOT NULL OR answered_inferred)
+                           AND (connected_at IS NOT NULL OR state IN ('COMPLETED','ABANDONED'))""").fetchone()
+    # EVENT_LAG: how often the Safety Controller held all dialing because events were late.
+    lagd = conn.execute("""SELECT count(*) AS decisions,
+                                  count(*) FILTER (WHERE 'EVENT_LAG' = ANY(reason_codes)) AS event_lag,
+                                  max((snapshot->>'event_lag_ms')::float) AS worst_lag_ms
+                           FROM safety_decisions""").fetchone()
+    deliv = conn.execute("""SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM received_at - provider_timestamp) * 1000) AS p50
+                            FROM provider_events WHERE event_type = 'ANSWERED'""").fetchone()
     s = sampler.samples
     # settle_checks=False: workers were stopped mid-flight, so some calls are legitimately unfinished.
     violations = [(name, n) for name, n in check_all(conn, settle_checks=False) if n]
@@ -108,6 +119,11 @@ def run_once(n_workers: int, seconds: float, agents: int, borrowers: int) -> dic
         "events": lag["total"], "events_unprocessed": lag["unprocessed"],
         "pacing_tick_gap_ms_avg": round(ticks["avg"] or 0), "pacing_tick_gap_ms_max": round(ticks["max"] or 0),
         "units_approved": permits["approved"], "units_claimed": permits["claimed"],
+        "answered": ab["answered"], "abandoned": ab["abandoned"],
+        "abandon_rate": round(ab["abandoned"] / ab["answered"], 4) if ab["answered"] else 0.0,
+        "decisions": lagd["decisions"], "event_lag_rejects": lagd["event_lag"],
+        "worst_event_lag_ms": round(lagd["worst_lag_ms"] or 0),
+        "answered_delivery_lag_ms_p50": round(deliv["p50"] or 0),
         "lock_waits_by_query": dict(sampler.waits_by_query.most_common(3)),
         "invariant_violations": violations,
     }
@@ -116,7 +132,8 @@ def run_once(n_workers: int, seconds: float, agents: int, borrowers: int) -> dic
 COLS = [("workers", "workers"), ("reservations_per_s", "res/s"), ("reserve_ms_p50", "p50 ms"),
         ("reserve_ms_p95", "p95 ms"), ("reserve_ms_p99", "p99 ms"), ("lock_waiting_avg", "lock-wait avg"),
         ("lock_wait_s_est", "lock-wait s"), ("event_lag_ms_p50", "ev lag p50"), ("event_lag_ms_p99", "ev lag p99"),
-        ("db_connections_max", "conns"), ("pacing_tick_gap_ms_avg", "tick gap ms"), ("invariant_violations", "violations")]
+        ("db_connections_max", "conns"), ("pacing_tick_gap_ms_avg", "tick gap ms"), ("abandon_rate", "abandon rate"),
+        ("event_lag_rejects", "EVENT_LAG rejects"), ("decisions", "decisions"), ("invariant_violations", "violations")]
 
 
 def main():

@@ -46,6 +46,13 @@ def decide(proposal: PacingProposal, snap: Snapshot, cfg: CampaignSettings, memo
     # 6. PROVIDER_HEALTH: circuit open, nothing goes out.
     if snap.breaker_state == "OPEN":
         return reject("PROVIDER_HEALTH", "circuit breaker OPEN")
+    # EVENT_LAG: answers reach us later than we may keep a borrower waiting. Any call dialed now,
+    # progressive included (its agent is reserved, but nobody can bridge an answer we have not
+    # seen), would be answered and abandoned before a worker applies ANSWERED. So no new dials at
+    # all until the inbox catches up; falling back to progressive would not help.
+    if snap.event_lag_ms > cfg.max_answer_hold_ms:
+        return reject("EVENT_LAG", f"provider events {snap.event_lag_ms:.0f} ms late (p90 over {cfg.event_lag_window_s:.0f} s"
+                                   f" or oldest unprocessed) > max_answer_hold_ms {cfg.max_answer_hold_ms}")
 
     reasons: list[str] = []
     mode = proposal.mode

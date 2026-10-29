@@ -148,3 +148,57 @@ def test_calling_window_uses_the_injected_clock(conn, monkeypatch):
     assert night.local_time == time(20, 0)
     d, _ = run(pred(5, at=night.taken_at), replace(night, leader_ok=True), cfg=cfg)
     assert d.reason_codes == ("OUTSIDE_CALLING_WINDOW",) and d.approved_calls == 0
+
+
+def test_event_lag_rejects_every_dial_progressive_included():
+    """Events arriving later than the answer hold: any new call would be abandoned before we see
+    its ANSWERED. REJECT outright, not a progressive fallback, for both modes."""
+    late = snap(available=10, event_lag_ms=CFG.max_answer_hold_ms + 1)
+    for proposal in (pred(12), PacingProposal(5, "PROGRESSIVE", "test", NOW)):
+        d, _ = run(proposal, late)
+        assert (d.outcome, d.approved_calls, d.reason_codes) == ("REJECT", 0, ("EVENT_LAG",))
+    ok, _ = run(pred(12), snap(available=10, event_lag_ms=CFG.max_answer_hold_ms))
+    assert ok.outcome == "APPROVE" and "EVENT_LAG" not in ok.reason_codes
+
+
+def _event(conn, call_id, *, sent_ago_s, received_ago_s, processed):
+    import uuid
+    conn.execute(
+        """INSERT INTO provider_events (provider_name, provider_event_id, call_id, event_type, provider_timestamp,
+                                        received_at, processed_at, processing_result)
+           VALUES ('A', %s, %s, 'RINGING', now() - %s * interval '1 second', now() - %s * interval '1 second',
+                   CASE WHEN %s THEN now() END, CASE WHEN %s THEN 'APPLIED' END)""",
+        (uuid.uuid4().hex, call_id, sent_ago_s, received_ago_s, processed, processed))
+
+
+def _call(conn, cid):
+    b = conn.execute("SELECT id FROM borrowers WHERE campaign_id = %s LIMIT 1", (cid,)).fetchone()["id"]
+    return conn.execute("""INSERT INTO calls (id, campaign_id, borrower_id, mode, provider_name, state, state_rank)
+                           VALUES (gen_random_uuid(), %s, %s, 'PROGRESSIVE', 'A', 'FAILED', 9) RETURNING id""", (cid, b)).fetchone()["id"]
+
+
+def test_snapshot_measures_event_lag_from_the_inbox(conn):
+    """Lag is provider time -> applied, p90 over the window, or the oldest unprocessed event."""
+    from smartdialer.config import load_settings
+    from smartdialer.safety.snapshot import load_snapshot
+    from tests.helpers import make_campaign
+    cid = make_campaign(conn, agents=1, borrowers=1)
+    other = make_campaign(conn, agents=1, borrowers=1)
+    cfg = load_settings(conn, cid)
+    lag = lambda: load_snapshot(conn, cid, cfg, "w", None).event_lag_ms   # noqa: E731
+    assert lag() == 0.0, "no events, no lag"
+    call = _call(conn, cid)
+    for _ in range(10):
+        _event(conn, call, sent_ago_s=0.3, received_ago_s=0.2, processed=True)
+    assert 250 < lag() < 1000
+    _event(conn, _call(conn, other), sent_ago_s=60, received_ago_s=1, processed=False)
+    assert lag() < 1000, "another campaign's backlog is not ours"
+    for _ in range(3):   # 3 of 13 events delivered 8 s late, like the 32-worker load test
+        _event(conn, call, sent_ago_s=8.3, received_ago_s=1, processed=True)
+    assert lag() > 8000
+    conn.execute("DELETE FROM provider_events WHERE provider_timestamp < now() - interval '5 seconds'")
+    _event(conn, call, sent_ago_s=3, received_ago_s=3, processed=False)   # one event stuck, unapplied
+    assert 2900 < lag() < 4000
+    snap = load_snapshot(conn, cid, cfg, "w", None)
+    d, _ = run(PacingProposal(1, "PROGRESSIVE", "test", snap.taken_at), replace(snap, leader_ok=True), cfg=cfg)
+    assert d.reason_codes == ("EVENT_LAG",)
