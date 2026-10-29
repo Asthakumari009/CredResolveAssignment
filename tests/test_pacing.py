@@ -74,3 +74,40 @@ def test_ringing_calls_count_against_capacity():
 def test_progressive_proposes_available():
     p = progressive.propose(snap(available=7))
     assert (p.requested_calls, p.mode) == (7, "PROGRESSIVE")
+
+
+def test_answer_rate_window_counts_only_calls_that_rang(conn):
+    """Provider errors, timeouts and never-dialed calls say nothing about whether people answer:
+    they must not count as 'not answered', or a sick provider would make p look low and pacing
+    would overdial. Only answered calls and real NO_ANSWER / BUSY outcomes are sampled."""
+    from smartdialer.config import load_settings
+    from smartdialer.safety.snapshot import load_snapshot
+    from tests.helpers import make_campaign
+    cid = make_campaign(conn, borrowers=1)
+    b = conn.execute("SELECT id FROM borrowers").fetchone()["id"]
+    outcomes = ([("COMPLETED", None, True)] * 3 + [("ABANDONED", None, True)]          # rang, answered
+                + [("FAILED", "NO_ANSWER", False)] * 4 + [("FAILED", "BUSY", False)] * 2  # rang, not answered
+                + [("FAILED", "PROVIDER_ERROR", False)] * 5 + [("FAILED", "TIMEOUT", False)] * 5
+                + [("CANCELLED", "NOT_DIALED", False)] * 5)                            # never rang
+    for i, (state, reason, answered) in enumerate(outcomes):
+        conn.execute(
+            """INSERT INTO calls (id, campaign_id, borrower_id, mode, state, state_rank, provider_name, failure_reason,
+                   answered_at, ended_at, created_at)
+               VALUES (gen_random_uuid(), %s, %s, 'PREDICTIVE', %s, 9, 'A', %s,
+                   CASE WHEN %s THEN now() END, now(), now() - %s * interval '1 second')""",
+            (cid, b, state, reason, answered, len(outcomes) - i))
+    snap = load_snapshot(conn, cid, load_settings(conn, cid), "w", None)
+    assert (snap.window_n, snap.window_answered) == (10, 4), "4 answered of 10 that rang; 15 errors excluded"
+
+
+def test_simulator_window_excludes_unplaced_calls():
+    """Same rule in the simulator: calls the provider never placed are not 'not answered'."""
+    from sim.scenarios import SCENARIOS
+    from sim.simulator import Call, Sim
+    sim = Sim(SCENARIOS["A"], "PREDICTIVE", "A")
+    sim.calls = ([Call(i, "PREDICTIVE", 0.0, answered=True) for i in range(4)]
+                 + [Call(10 + i, "PREDICTIVE", 0.0, answered=False) for i in range(6)]
+                 + [Call(20 + i, "PREDICTIVE", 0.0, answered=False, placed=False) for i in range(15)])
+    sim.cut = len(sim.calls)
+    snap = sim.snapshot()
+    assert (snap.window_n, snap.window_answered) == (10, 4)
