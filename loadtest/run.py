@@ -60,9 +60,10 @@ def run_once(n_workers: int, seconds: float, agents: int, borrowers: int) -> dic
     conn = fresh_db()
     campaign(conn, agents=agents, borrowers=borrowers, settings={"max_attempts": 1})
     with services(webhook_workers=4, agent_wrap_up_s=0.5), tempfile.TemporaryDirectory() as tmp:
-        # Provider A as specified (1% explicit errors). time_scale 0.15: talk ~1.5 s real, ring-out 4.5 s.
-        # Keeps demand from 1,000 agents (~250 calls/s) under the mock's own ceiling (~300 calls/s
-        # with events, measured), so the numbers below are the dialer's, not the mock's.
+        # Provider A as specified (1% explicit errors). time_scale 0.15: ring-out 4.5 s real; talk is
+        # 10 s simulated but the mock's min_talk_real_s floor holds it to at least 6 s real, so 1,000
+        # agents generate about 150 calls/s. At 16+ workers on one 8-CPU machine the mock's webhook
+        # delivery falls behind (docs/SCALING.md), so those numbers include the mock.
         control("A", talk_mean_s=10.0, time_scale=0.15)
         sampler = DbSampler()
         sampler.start()

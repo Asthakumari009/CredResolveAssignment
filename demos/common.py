@@ -16,6 +16,10 @@ WEBHOOK_URL = "http://127.0.0.1:8002"
 TABLES = ("provider_events", "call_transitions", "agent_transitions", "safety_decisions", "calls",
           "dial_permits", "borrowers", "agents", "workers", "campaigns")
 T0 = time.monotonic()
+# Demos run at any hour against the real 08:00-19:00 calling window, so they pin the wall clock the
+# window rule reads (smartdialer/clock.py) to midday in the campaigns' timezone. Inherited by every
+# process they spawn. Set SMARTDIALER_NOW yourself to see the window rule reject.
+os.environ.setdefault("SMARTDIALER_NOW", "2026-10-29T13:00:00+05:30")
 
 
 def say(msg: str) -> None:

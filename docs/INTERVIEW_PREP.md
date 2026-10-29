@@ -87,7 +87,9 @@ From `docs/SCALING.md`, measured:
   which is too much for one campaign at low answer rates. 100,000 needs partitioning everywhere.
 - Fixed with batch claims (`SafetyController.claim_units` plus a `FOR KEY SHARE` pin per call). p50 reservation
   latency went from 18 to 4.6 ms, and throughput rose 28% to 77%. The new bottleneck is the pacing leader's tick cadence (it shares
-  a loop with dispatch and dials, so it ticks every 340 to 570 ms instead of 250) and then the claim row itself.
+  a loop with dispatch and dials, so it ticks every 1.0 to 1.8 s on the current code instead of 250 ms) and then the claim
+  row itself. Throughput on the current code is about 78 reservations/s at 8 workers; at 16 and 32 workers the mock's webhook
+  delivery saturates the shared CPUs and most answers arrive too late to bridge (`docs/SCALING.md`).
 - Next fixes: a dedicated pacing loop, shard the permit, partition by campaign or
   agent pool, PgBouncer, a partitioned inbox, sharded provider health.
 - Adding servers alone makes it worse: more waiters on one lock, slower lock holders, and workers stuck
@@ -143,17 +145,25 @@ the predictive formula's N, reduced by whichever rule appears in `reason_codes`.
   the window of 20 attempts never fills and the breaker stays CLOSED through an outage. Seen in the
   provider_outage demo. Fix: a minimum volume before judging (report UNKNOWN, handled like DEGRADED), or an
   active health probe per provider feeding the same window (`docs/SCALING.md`, fix 10).
+- **A hung provider delays ANSWERED for every call (NOT BUILT).** Each worker runs one loop: dispatch
+  (provider dials), inbox events, answer hold and reconciliation polls, in that order. When a provider hangs,
+  each pass waits up to the 3 s client timeout before it reaches the inbox, so ANSWERED events (for any
+  provider) are applied 1 to 3 s late. Past the 2 s `max_answer_hold_ms` that is a real abandon: the
+  borrower answered and nobody was bridged in time. Seen in the provider_outage demo (about 4 abandons
+  per run at OUTAGE ON, `ANSWER_PROCESSED_TOO_LATE`). Fix: separate event processing from provider I/O,
+  so a slow provider call never sits in front of the inbox. It is the same fix as the pacing tick cadence
+  (`docs/SCALING.md`, fix 2): give the latency-critical work its own loop.
 - **Leader takeover.** For one tick around a takeover, the new leader's snapshot may not include the old
   leader's last consumed units. The hard cap bounds the overcount, but I have not measured it under load.
 
 ## 8. What would you do with one more week?
 
 1. **Fix the measured next bottleneck: pacing tick cadence (NOT BUILT).** After batch claims, the leader
-   ticks every 340 to 570 ms instead of 250 ms. It is an ordinary worker, so dials (up to 3 s) and event
+   ticks every 1.0 to 1.8 s instead of 250 ms. It is an ordinary worker, so dials (up to 3 s) and event
    batches sit in front of its tick, and agents who free up wait for the next permit (`docs/SCALING.md`,
    "After: what is the bottleneck now"). The fix is a dedicated pacing loop: a thread or process that only runs
    `try_lead`, pacing and `SafetyController.decide`. Then shard the permit (SCALING fix 3) and rerun the
-   8/16/32 sweep. Not needed at 1,000 agents (at most about 37 dials/s against about 160/s measured), so it
+   8/16/32 sweep. Not needed at 1,000 agents (at most about 37 dials/s against about 78/s measured), so it
    was left out in the feature freeze.
 2. Early drift signal from answers only, and attribute abandons per provider so Provider B's event
    loss does not count against pacing.

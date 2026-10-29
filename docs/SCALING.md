@@ -1,6 +1,7 @@
 # Scaling
 
-All numbers here are measured by `make loadtest ARGS="--workers 8 16 32"` (`loadtest/run.py`).
+All current numbers here are measured on the current code by `make loadtest ARGS="--workers 8 16 32"`
+(`loadtest/run.py`, raw output in `results/loadtest/results.json`, which is local and not committed).
 Each run is a fresh database with **1,000 agents, 50,000 borrowers, one progressive campaign,
 Provider A, 60 s**.
 
@@ -8,41 +9,49 @@ Provider A, 60 s**.
 
 - Everything runs on one machine: Docker Desktop with 8 CPUs, shared by Postgres, the mock
   provider, the webhook receiver (4 processes) and N worker processes.
-- Talk time is about 1.5 s real (10 s simulated at `time_scale` 0.15) and ring-out is 4.5 s, so 1,000
-  agents generate about 250 calls/s of demand. That is far more than real traffic (see below).
-- The mock provider's own ceiling was measured first, so its limits are not mistaken for the dialer's. It does
-  about 1,100 dials/s without events and about 300 calls/s with webhooks. Webhook delivery originally used
-  httpx's async client at about 70 events/s, which made the mock the bottleneck. It was switched
-  to a thread pool at about 600 events/s (PLAN D11). In every run below, webhook delivery lag (provider
-  timestamp to inbox) stayed under 0.2 s and no dial timed out, so the provider was not the constraint.
+- Talk time: the load test asks for 10 s simulated at `time_scale` 0.15 (1.5 s real), but the mock now
+  holds every answered call for at least `min_talk_real_s` = 6 s of real time, so a borrower never hangs
+  up faster than a dialer could bridge them. Ring-out is 4.5 s. An agent's cycle is therefore about
+  6.5 s on average, so 1,000 agents generate about **150 calls/s** of demand. That is still far more than
+  real traffic (see below).
 - Reservation latency is the time to create one call, timed in the worker: the permit work (a claim when
   the worker has no units left, then the pin), borrower lease, agent reservation, call insert, commit.
   Lock waits are sampled from `pg_stat_activity` every 250 ms. "Lock-wait s" is waiting backends x interval,
   an estimate.
+- **The mock provider is part of the measurement at 16 and 32 workers.** Its webhook delivery competes for
+  the same 8 CPUs. At 32 workers, ANSWERED events reached the inbox a median **8.3 s** (p90 10.7 s) after
+  the provider sent them, while processing them took 0.04 s. See "Overload turns into abandons" below.
 
-## Results
+## Results (current code)
 
-Two sweeps: **before**, where each call's transaction locked the permit row (`consume_one`), and
-**after**, where units are claimed in batches (ADR-4). Raw output: `results/loadtest/before_batch_claims.json`
-and `results/loadtest/results.json`.
-
-| Workers | | Reservations/s | p50 ms | p95 ms | p99 ms | Backends waiting on a lock (avg / max) | Lock-wait s (est.) | Event lag p50 / p99 ms | DB connections (peak) | Invariant violations |
+| Workers | Reservations/s | p50 ms | p95 ms | p99 ms | Backends waiting on a lock (avg / max) | Lock-wait s (est.) | Event lag p50 / p99 ms | Connected calls | DB connections (peak) | Invariant violations |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 8 | before | 108.0 | 18 | 70 | 120 | 2.2 / 7 | 134 | 97 / 965 | 40 | 0 |
-| 8 | **after** | **165.8** | **4.6** | 12 | 22 | 0.07 / 4 | 4 | 39 / 400 | 36 | 0 |
-| 16 | before | 123.3 | 41 | 188 | 323 | 7.1 / 15 | 431 | 247 / 1,547 | 45 | 0 |
-| 16 | **after** | **157.8** | **5.3** | 14 | 25 | 0.34 / 11 | 21 | 7 / 206 | 51 | 0 |
-| 32 | before | 78.5 | 117 | 516 | 831 | 12.4 / 31 | 787 | 493 / 2,400 | 66 | 0 |
-| 32 | **after** | **138.8** | **7.4** | 24 | 46 | 2.4 / 27 | 142 | 5 / 199 | 66 | 0 |
+| 8 | **78.6** | 10.6 | 32 | 52 | 0.08 / 3 | 5 | 154 / 906 | 1,324 | 45 | 0 |
+| 16 | **77.5** | 16.8 | 73 | 171 | 0.51 / 10 | 31 | 79 / 1,360 | 322 | 54 | 0 |
+| 32 | **50.0** | 16.4 | 77 | 223 | 2.78 / 25 | 195 | 51 / 4,786 | 38 | 68 | 0 |
 
-The "after" sweep was run twice. The first run gave 157.9 / 169.9 / 125.0 reservations/s, so treat
-differences under about 10% between worker counts as noise.
+Event lag is `processed_at - received_at` in the inbox, so it does not include webhook delivery.
 
 All invariants held in every run: no borrower with overlapping calls, no agent bound to two calls,
 every transition legal and chained, no duplicate transitions, permits never over-claimed, and calls per
-permit never more than claimed units. Event lag is `processed_at - received_at` in the inbox.
+permit never more than claimed units.
 
-## Before: the permit row was the bottleneck
+### Historical: the batch-claims fix (commit f550fcc)
+
+Measured when batch claims were introduced, on the code and mock of that commit (1.5 s real talk time,
+about 250 calls/s of demand, no talk floor, no late-answer rule). **Not comparable** to the table above;
+kept because it is the evidence for ADR-4. The "before" code no longer exists, so it cannot be rerun.
+
+| Workers | | Reservations/s | p50 ms | p95 ms | p99 ms | Backends waiting on a lock (avg / max) | Lock-wait s (est.) | Event lag p50 / p99 ms |
+|---|---|---|---|---|---|---|---|---|
+| 8 | before | 108.0 | 18 | 70 | 120 | 2.2 / 7 | 134 | 97 / 965 |
+| 8 | after | 165.8 | 4.6 | 12 | 22 | 0.07 / 4 | 4 | 39 / 400 |
+| 16 | before | 123.3 | 41 | 188 | 323 | 7.1 / 15 | 431 | 247 / 1,547 |
+| 16 | after | 157.8 | 5.3 | 14 | 25 | 0.34 / 11 | 21 | 7 / 206 |
+| 32 | before | 78.5 | 117 | 516 | 831 | 12.4 / 31 | 787 | 493 / 2,400 |
+| 32 | after | 138.8 | 7.4 | 24 | 46 | 2.4 / 27 | 142 | 5 / 199 |
+
+## Before: the permit row was the bottleneck (historical)
 
 Doubling workers from 8 to 16 bought only 14% more throughput. Doubling again to 32 *lost* 36% compared
 to 8, while p50 reservation latency rose 6.4x. A lock sampler run during a 32-worker load showed:
@@ -73,38 +82,51 @@ then **pins** the permit with `FOR KEY SHARE` (`SafetyController.pin`). That che
 live, and pins conflict neither with each other nor with claims. Units a worker claimed but did not use
 are dropped when the permit is revoked.
 
+Measured at commit f550fcc (historical table above):
+
 - p50 reservation latency: 18 / 41 / 117 ms before, 4.6 / 5.3 / 7.4 ms after.
 - Throughput: +54% at 8 workers, +28% at 16, +77% at 32.
 - Waiting backends at 8 workers: 2.2 before, 0.07 after.
 - Event lag p99 at 32 workers: 2.4 s before, 0.2 s after, because workers no longer queue on the permit row.
-- Units dropped (claimed, never a call): 423 of 10,667 (4.0%) at 8 workers, 71 of 9,803 (0.7%) at 16, and
-  18 of 8,488 (0.2%) at 32. They only ever mean fewer calls, never more.
 
-## After: what is the bottleneck now
+## Now: what limits the current code
 
-Throughput is now flat at about 140 to 170 reservations/s from 8 to 32 workers, while demand is about
-250/s and hundreds of agents sit AVAILABLE. Lock waits do not limit it at 8 or 16 workers.
-The new limit is **permit supply from the single pacing leader**:
+Throughput is about 78 reservations/s at 8 and 16 workers and 50/s at 32, against about 150/s of
+demand, with hundreds of agents AVAILABLE (743 at the end of the 32-worker run).
 
 | Workers | Pacing tick gap avg / max (target 250 ms) | Units approved | Units claimed | Calls |
 |---|---|---|---|---|
-| 8 | 568 / 2,315 ms | 14,705 | 10,667 | 10,244 |
-| 16 | 336 / 611 ms | 11,034 | 9,803 | 9,732 |
-| 32 | 439 / 1,142 ms | 9,647 | 8,488 | 8,470 |
+| 8 | 1,801 / 3,718 ms | 15,482 | 5,307 | 4,808 |
+| 16 | 1,108 / 4,177 ms | 6,787 | 5,042 | 4,883 |
+| 32 | 1,021 / 4,647 ms | 4,012 | 3,662 | 3,656 |
 
-- The leader is an ordinary worker. It runs the pacing tick in the same loop as dispatch, provider dials
-  (up to 3 s), event processing and reconciliation. So its ticks arrive every 340 to 570 ms instead of 250 ms.
-  An agent who frees up just after a tick waits for the next one. Each progressive permit approves about
-  the agents available at that instant, and it expires 2 s later.
-- **At 8 workers**, workers cannot spend what is approved: 27% of approved units are never claimed before
-  the permit is replaced. The limit is dispatch capacity (8 Python loops), plus the leader's slow ticks.
-- **At 32 workers**, approvals themselves shrink (9,647). Ticks slow down again because 32 worker
-  processes, Postgres, the mock and the webhook share 8 CPUs. The claim statement also has a queue now: 2.4 waiting
-  backends on average, all on `UPDATE dial_permits ... consumed_count + k`. The lock is short, but it is still one row.
+- **Pacing tick cadence.** The leader is an ordinary worker. It runs the pacing tick in the same loop as
+  dispatch, provider dials and hang-ups (up to 3 s each), event processing and reconciliation. Its ticks
+  now arrive every 1.0 to 1.8 s on average instead of 250 ms (the batch-claims sweep measured 340 to 570 ms).
+  An agent who frees up just after a tick waits for the next one, and each progressive permit expires 2 s
+  after it is issued.
+- **At 8 workers**, workers cannot spend what is approved: 66% of approved units are never claimed before
+  the permit is replaced. The limit is dispatch capacity (8 Python loops that also do provider I/O),
+  plus the leader's slow ticks.
+- **At 16 and 32 workers**, approvals themselves shrink, and the claim statement queues: 2.8 waiting backends
+  on average at 32 workers, nearly all on `UPDATE dial_permits ... consumed_count + k`.
 
-Proposed fix, **NOT BUILT** (feature freeze): give the pacing leader its own loop (a thread or process
-that only paces, so ticks are on time), then shard the permit (fix 3 below) to remove the last shared
-row from the dispatch path. This stays the measured next bottleneck.
+### Overload turns into abandons
+
+Connected calls fall from 1,324 at 8 workers to 322 at 16 and 38 at 32. At 32 workers, 1,034 of 1,072
+answered calls ended `ABANDONED (ANSWER_PROCESSED_TOO_LATE)`. The cause is webhook delivery, not the
+dialer's processing: ANSWERED reached the inbox a median 8.3 s after the provider sent it, because the mock's
+delivery threads, 32 workers and Postgres share 8 CPUs. By the time a worker applies the answer, the 2 s
+hold is long gone, so the call is recorded as an abandon and hung up. That is the correct outcome: the
+borrower answered and nobody was bridged for 8 s. The previous sweep, before the late-answer rule, recorded
+such calls as CONNECTED. Each of these hang-ups is one more request to the already overloaded provider,
+so the overload feeds itself. In production the equivalent is a slow or lagging webhook path, and the
+abandon budget would then force progressive dialing. Measuring the dialer alone at this rate needs the
+mock on separate hardware.
+
+Proposed fix, **NOT BUILT** (feature freeze): give the pacing leader and event processing their own loops,
+apart from provider I/O (fix 2 below), then shard the permit (fix 3) to remove the last shared row from
+the dispatch path.
 
 ## Why "add more servers" makes it worse
 
@@ -112,8 +134,8 @@ Throughput is bounded by shared rows and a single decider. Adding workers does n
 It adds waiters:
 
 - Before the fix, every extra worker queued on the permit lock while holding a connection, the lock
-  holder ran slower on a busier CPU, and throughput fell from 123/s to 78/s.
-- After the fix, the same shape remains at a higher level: 166/s at 8 workers, 139/s at 32. More claimers
+  holder ran slower on a busier CPU, and throughput fell from 123/s to 78/s (historical sweep).
+- On the current code the same shape remains: 79/s at 8 workers, 50/s at 32. More claimers
   queue on the (now short) claim statement, and more processes slow down the leader's tick.
 - Workers stuck on a lock are not processing events, so event lag rises too (before: 97 ms to 493 ms p50).
 
@@ -142,14 +164,14 @@ one, which lowers U and therefore the dial rate. For 1,000 agents, with the simu
 | C | 70% | 180 s | 1000 / (0.70 x 195) = **7.3** | 7.3 x 88.2% = 6.5 |
 
 So 1,000 agents need **at most about 37 dials/s**, at the lowest answer rate (A), and the rate scales linearly
-with N. Each dial produces 3 to 4 inbox events. Measured per-campaign throughput: about 115 reservations/s before batch
-claims, 140 to 170/s after.
+with N. Each dial produces 3 to 4 inbox events. Measured per-campaign throughput on the current code, on one 8-CPU
+machine with the mock provider sharing it: about 78 reservations/s (8 and 16 workers), 50/s at 32.
 
 | Agents | Dials/s (C to A, upper bound) | Inbox events/s | What breaks first |
 |---|---|---|---|
 | 100 | 0.7 to 3.7 | up to about 13 | Nothing. One worker is enough; more workers are for crash tolerance |
-| 1,000 | 7 to 37 | up to about 130 | Nothing in one campaign: 37/s is under a third of even the pre-batching throughput. The `provider_health` row (C5) and the per-tick snapshot query start to show up if there are many campaigns |
-| 10,000 | 73 to 370 | up to about 1,300 | **Per-campaign permit supply**, if those agents are in one campaign at a low answer rate: A needs 370/s and B 190/s, against 140 to 170/s measured (pacing tick cadence, then the claim row). C (73/s) fits. Next: inbox write volume and connection count as workers grow |
+| 1,000 | 7 to 37 | up to about 130 | Nothing in one campaign: 37/s is under half of the measured 78/s. The `provider_health` row (C5) and the per-tick snapshot query start to show up if there are many campaigns |
+| 10,000 | 73 to 370 | up to about 1,300 | **Per-campaign permit supply**, if those agents are in one campaign at a low answer rate: A needs 370/s and B 190/s, against about 78/s measured (pacing tick cadence, then the claim row). C (73/s) is at the limit. Next: inbox write volume and connection count as workers grow |
 | 100,000 | 730 to 3,700 | up to about 13,000 | Single Postgres write throughput for transitions plus inbox, connection count, and the inbox table size |
 
 ## Fixes, in the order I would apply them

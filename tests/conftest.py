@@ -10,6 +10,13 @@ TABLES = ("provider_events", "call_transitions", "agent_transitions", "safety_de
           "dial_permits", "borrowers", "agents", "workers", "campaigns")
 
 
+# Tests pin the wall clock the calling-window rule reads (smartdialer/clock.py) to midday in the
+# default campaign timezone, so they keep the real 08:00-19:00 window at any hour. Set before any
+# test runs, and inherited by worker processes the tests spawn. A test can override it with
+# monkeypatch.setenv.
+os.environ["SMARTDIALER_NOW"] = "2026-10-29T13:00:00+05:30"
+
+
 @pytest.fixture(scope="session")
 def dsn():
     """A fresh test database, migrated once per session."""

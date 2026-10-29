@@ -131,3 +131,20 @@ def test_recovery_ramp_after_breaker_closes():
     assert done.approved_calls == 20 and "PROVIDER_HEALTH" not in done.reason_codes
     tiny = run(pred(1), snap(available=10, breaker_state="CLOSED", breaker_age_s=0.0))[0]
     assert tiny.approved_calls == 1, "never ramps a nonzero approval down to zero"
+
+
+def test_calling_window_uses_the_injected_clock(conn, monkeypatch):
+    """Real 08:00-19:00 window, clock set explicitly: 13:00 IST dials, 20:00 IST is rejected."""
+    from smartdialer.config import load_settings
+    from smartdialer.safety.snapshot import load_snapshot
+    from tests.helpers import make_campaign
+    cid = make_campaign(conn, mode="PREDICTIVE", agents=5)   # default timezone Asia/Kolkata
+    cfg = load_settings(conn, cid)
+    assert (cfg.window_start, cfg.window_end) == ("08:00", "19:00")
+    noon = load_snapshot(conn, cid, cfg, "w", None)
+    assert noon.local_time == time(13, 0)
+    monkeypatch.setenv("SMARTDIALER_NOW", "2026-10-29T20:00:00+05:30")
+    night = load_snapshot(conn, cid, cfg, "w", None)
+    assert night.local_time == time(20, 0)
+    d, _ = run(pred(5, at=night.taken_at), replace(night, leader_ok=True), cfg=cfg)
+    assert d.reason_codes == ("OUTSIDE_CALLING_WINDOW",) and d.approved_calls == 0

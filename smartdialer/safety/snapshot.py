@@ -1,5 +1,6 @@
 """One consistent read of everything pacing and safety need. Used independently by the pacing
 engine and by the Safety Controller: the controller never trusts numbers the pacer passes in."""
+from smartdialer import clock
 from smartdialer.config import CampaignSettings
 from smartdialer.domain.types import Snapshot
 
@@ -7,7 +8,7 @@ _TERMINAL = "('COMPLETED','FAILED','CANCELLED','ABANDONED')"
 
 _SQL = f"""
 SELECT now() AS taken_at,
-       (now() AT TIME ZONE c.timezone)::time AS local_time,
+       (%(wall_clock)s::timestamptz AT TIME ZONE c.timezone)::time AS local_time,
        c.fencing_token,
        (c.pacing_lease_owner = %(worker)s AND c.pacing_lease_expires_at > now()) AS lease_mine,
        COALESCE((SELECT breaker_state FROM provider_health WHERE provider_name = c.provider_name), 'CLOSED') AS breaker_state,
@@ -60,7 +61,7 @@ WHERE c.id = %(campaign)s
 
 
 def load_snapshot(conn, campaign_id: int, cfg: CampaignSettings, worker_id: str, fencing_token: int | None) -> Snapshot:
-    r = conn.execute(_SQL, {"campaign": campaign_id, "worker": worker_id, "short": cfg.short_window,
+    r = conn.execute(_SQL, {"campaign": campaign_id, "worker": worker_id, "wall_clock": clock.now(), "short": cfg.short_window,
                             "window": cfg.answer_window, "abandon_window": cfg.abandon_window,
                             "drop_window": cfg.agent_drop_window_s}).fetchone()
     return Snapshot(

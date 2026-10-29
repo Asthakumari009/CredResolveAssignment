@@ -1,22 +1,13 @@
 import itertools
 import json
 import uuid
-from datetime import datetime, timezone
 
 from smartdialer.providers.interface import CallStatus, DialAccepted
 
 
-def midday_timezone() -> str:
-    """A fixed-offset zone where it is about 13:00 right now. Tests and demos keep the real
-    08:00-19:00 calling window and run at any wall-clock hour by placing the campaign there,
-    instead of switching the window rule off. (Etc/GMT signs are inverted: Etc/GMT-5 is UTC+5.)"""
-    offset = 13 - datetime.now(timezone.utc).hour   # -10 .. +13, all valid Etc/GMT zones
-    return "Etc/GMT" if offset == 0 else f"Etc/GMT{-offset:+d}"
-
-
 def make_campaign(conn, *, mode="PROGRESSIVE", agents=0, borrowers=0, provider="A", settings=None, agent_state="AVAILABLE"):
-    cid = conn.execute("INSERT INTO campaigns (name, mode, provider_name, settings, timezone) VALUES ('test', %s, %s, %s, %s) RETURNING id",
-                       (mode, provider, json.dumps(settings or {}), midday_timezone())).fetchone()["id"]
+    cid = conn.execute("INSERT INTO campaigns (name, mode, provider_name, settings) VALUES ('test', %s, %s, %s) RETURNING id",
+                       (mode, provider, json.dumps(settings or {}))).fetchone()["id"]
     if agents:
         conn.execute("INSERT INTO agents (campaign_id, name, state) SELECT %s, 'agent-' || g, %s FROM generate_series(1, %s) g",
                      (cid, agent_state, agents))
